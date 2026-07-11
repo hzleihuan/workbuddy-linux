@@ -6,8 +6,24 @@ electron_arch() {
         x86_64) echo "x64" ;;
         aarch64) echo "arm64" ;;
         armv7l) echo "armv7l" ;;
+        loongarch64) echo "loong64" ;;
         *) error "Unsupported architecture: $ARCH" ;;
     esac
+}
+
+# Parse Electron version from a path like:
+#   /path/to/electron-v37.2.5-linux-loong64.zip  -> 37.2.5
+#   /path/to/electron-v41.1.1-linux-x64.zip      -> 41.1.1
+parse_electron_version_from_path() {
+    local path="$1"
+    local basename
+    basename="$(basename "$path")"
+    # Match electron-v<semver>-... pattern
+    if [[ "$basename" =~ ^electron-v([0-9]+(\.[0-9]+){1,2})- ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
 }
 
 download_electron_runtime() {
@@ -15,6 +31,34 @@ download_electron_runtime() {
 
     arch="$(electron_arch)"
     zip_name="electron-v${ELECTRON_VERSION}-linux-${arch}.zip"
+
+    # If ELECTRON_LOCAL_ZIP is set, use the local file directly instead of
+    # downloading. This is essential for architectures without official
+    # Electron binaries (e.g. loongarch64) where users build or obtain
+    # Electron from community sources.
+    if [ -n "${ELECTRON_LOCAL_ZIP:-}" ]; then
+        if [ ! -f "$ELECTRON_LOCAL_ZIP" ]; then
+            error "ELECTRON_LOCAL_ZIP is set but file not found: $ELECTRON_LOCAL_ZIP"
+        fi
+        info "Using local Electron runtime: $ELECTRON_LOCAL_ZIP"
+
+        # Detect Electron version from the local zip filename so that
+        # subsequent native module rebuilds use matching ABI headers.
+        local detected_version
+        detected_version="$(parse_electron_version_from_path "$ELECTRON_LOCAL_ZIP" || true)"
+        if [ -n "${detected_version:-}" ]; then
+            ELECTRON_VERSION="$detected_version"
+            info "Detected Electron version from local zip: $ELECTRON_VERSION"
+        else
+            warn "Could not parse version from ELECTRON_LOCAL_ZIP filename; using ELECTRON_VERSION=$ELECTRON_VERSION"
+            warn "If native modules fail to load, set ELECTRON_VERSION to match your local zip."
+        fi
+
+        unzip -qo "$ELECTRON_LOCAL_ZIP" -d "$INSTALL_DIR"
+        [ -x "$INSTALL_DIR/electron" ] || error "Electron binary was not extracted from local zip"
+        return 0
+    fi
+
     if [ -n "$ELECTRON_MIRROR" ]; then
         url="${ELECTRON_MIRROR%/}/v${ELECTRON_VERSION}/${zip_name}"
     else

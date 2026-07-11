@@ -68,6 +68,28 @@ make build-app
 make build-app DMG=/path/to/WorkBuddy.dmg
 ```
 
+### 自动获取最新版 DMG（官网 API）
+
+如果不想手动放置 DMG，可通过 `make download` 让脚本自动从 WorkBuddy 官网更新接口拉取最新版本的 DMG 并保存到 `downloads/`：
+
+```bash
+make download
+```
+
+脚本会请求 `https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-x64`，解析返回 JSON 中的 `url` 字段（指向 `.zip` 包），将后缀替换为 `.dmg` 后即得 DMG 下载地址并下载。若 `downloads/` 中已存在 DMG，则跳过下载。
+
+此外，`make install` 已升级为完整的一键安装链路：**自动下载最新 DMG → 构建 → 打包 → 安装**：
+
+```bash
+make install
+```
+
+可通过环境变量覆盖更新接口或平台：
+
+```bash
+WB_UPDATE_API=https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-arm64 make download
+```
+
 ### 运行生成的应用
 
 ```bash
@@ -130,10 +152,20 @@ WorkBuddy 基于 VS Code/Electron 开发，其 macOS 应用的 `app.asar` 文件
 9. **WorkBuddy App / 小程序远程控制重启后需要手动开关**：上游 `ClawLifecycle.start()` 启动时会恢复已保存通道并启动 Centrifugo，但微信/小程序集成的 `wechatmp` 默认启用状态可能只停留在本地配置，后台注册和远程订阅没有在桌面端重启后完整重放。**修复方式**：Linux 运行时补丁在 Claw 生命周期启动后延迟重放已启用的 `wechatmp` 集成，重新写入启用状态、调用后台注册并启动 Centrifugo，避免关闭再打开程序后必须手动关闭/打开「微信/小程序集成」开关。
 10. **子进程环境变量丢失导致模型无法响应（5.1.1）**：Env Proxy 的 `ownKeys` 不返回 `ACC_PRODUCT_CONFIG_V3`，`spillOversizedEnv()` 通过 `Object.assign({}, env)` 拷贝时遗漏了隐藏 key，非 oversized（<100KB）时直接返回原 Proxy 对象，子进程始终拿不到该环境变量。**修复方式**：始终构建普通对象拷贝 env，显式将隐藏的 `ACC_PRODUCT_CONFIG_V3/V2` 添加到子进程 env 中，超过 100KB 的仍 spill 到文件。
 11. **`composePromptForBackend` 锚点未适配 5.1.1 代码结构**：上游 5.x 将 `composeUserPrompt` 的参数从 `cloneDesiredConfig(session.desiredConfig)` 改为 `session.desiredConfig`，导致补丁的字符串锚点匹配失败，`composePromptForBackendTimeout` 补丁被跳过，首条聊天消息可能卡死在 prompt 合成阶段。**修复方式**：将匹配模式更新为 `session.desiredConfig`，同时保留 5s `Promise.race` 超时 + 原始 prompt 回退逻辑。
+12. **更新 RPC 锚点兼容 v5.2.3+**：上游 5.2.3 将 `registerUpdateHandlers(server, deps)` 改为 `registerUpdateHandlers(registry, deps)`，并把 `handleRpc$1` 改为 `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)`。旧锚点失配会导致更新 RPC 禁用补丁（`updateRpcDisabled`）被跳过，残留的 macOS/Windows 更新菜单项仍会调用不可用的更新器代码路径。**修复方式**：补丁同时搜索新旧两套函数签名，按命中版本注入对应的 Linux no-op RPC 桩（`updateCheck` / `updateDownload` / `updateArchMismatchDownload` / `updateArchMismatchInstall` / `updateQuitAndInstall` / `updateGetState`），旧版本行为完全不变。
+13. **网络诊断超时补丁改为可选（v5.2.3+）**：上游 5.2.3 移除了网络诊断代码，原 `networkDiagnosticsTimeouts` 必需补丁在找不到锚点时会中止整个构建。**修复方式**：将该补丁标记为 optional，缺失时仅打印告警日志，不再中断构建流程。
 
 ## 版本适配说明
 
-当前补丁基于官方 WorkBuddy **4.22.10**（构建号 `27634624-ec5e02bd`）、**5.0.3**（构建号 `30150715-f5a1d06d`）和 **5.1.1**（构建号 `30799983-ecafd59f`）验证通过。5.x 使用 Electron 37.10.3，仍采用 `app.asar` + `app.asar.unpacked` 载荷结构。更高版本的 DMG 可能因为上游代码结构变化导致补丁无法正确应用；构建脚本会在必需补丁未命中时中止，并在成功时生成 `.workbuddy-linux/patch-report.json` 记录补丁命中结果。如遇到构建失败或运行异常，请在本仓库提 Issue 并附上所使用的 DMG 版本号。
+当前补丁基于官方 WorkBuddy **4.22.10**（构建号 `27634624-ec5e02bd`）、**5.0.3**（构建号 `30150715-f5a1d06d`）、**5.1.1**（构建号 `30799983-ecafd59f`）以及 **5.2.x**（实测 5.2.3 / 5.2.5）验证通过。5.x 使用 Electron 37.10.3，仍采用 `app.asar` + `app.asar.unpacked` 载荷结构。
+
+补丁对上游不同代码结构做了自动适配：
+- **v5.2.3+ 更新 RPC 锚点**：自动识别 `registerUpdateHandlers(server, deps)` / `handleRpc$1(server, ...)`（旧）与 `registerUpdateHandlers(registry, deps)` / `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)`（新）两套签名并分别注入对应的 Linux no-op RPC 桩；
+- **v5.2.3+ 网络诊断超时补丁降级为可选**：上游在 5.2.3 移除了网络诊断代码，该补丁锚点缺失时仅告警，不再中止构建。
+
+更高版本的 DMG 可能因为上游代码结构变化导致补丁无法正确应用；构建脚本会在必需补丁未命中时中止，并在成功时生成 `.workbuddy-linux/patch-report.json` 记录补丁命中结果。如遇到构建失败或运行异常，请在本仓库提 Issue 并附上所使用的 DMG 版本号。
+
+> **龙芯 LoongArch（loong64）说明**：官方未发布 loong64 架构的 Electron 二进制。请在构建前通过 `ELECTRON_LOCAL_ZIP=/path/to/electron-vX.Y.Z-linux-loong64.zip` 提供本地 Electron 运行时（版本号由文件名 `electron-vX.Y.Z-*.zip` 自动识别），原生模块会据此从源码重建；`@lydell/node-pty-linux-loong64` 由构建脚本基于重建产物合成。
 
 Linux 启动脚本默认启用 Chromium sandbox。只有在明确理解安全风险并需要临时排障时，才使用下面的方式降级启动：
 
@@ -152,6 +184,12 @@ WORKBUDDY_INSTALL_DIR=/opt/tmp/workbuddy-app bash install.sh
 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ bash install.sh
 # 自定义Electron头文件下载地址
 ELECTRON_HEADERS_URL=https://artifacts.electronjs.org/headers/dist bash install.sh
+# 使用本地 Electron 运行时（适用于无官方二进制的架构，如 loong64）
+ELECTRON_LOCAL_ZIP=/home/huzhou/下载/electron-v35.4.0-linux-loong64.zip bash install.sh
+# 覆盖 npm 镜像（原生模块重建 / 平台包安装时，若默认镜像无法代理某些包可指定）
+NPM_REGISTRY=https://registry.npmjs.org/ bash install.sh
+# 覆盖更新接口与平台（make download / make install 自动拉取 DMG 时使用）
+WB_UPDATE_API=https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-arm64 make download
 ```
 
 ## 仓库维护规范
@@ -253,6 +291,28 @@ You can also manually specify the path of the official DMG file:
 make build-app DMG=/path/to/WorkBuddy.dmg
 ```
 
+### Auto-fetch the Latest DMG (Official API)
+
+If you do not want to place a DMG manually, `make download` lets the script auto-fetch the latest DMG from the WorkBuddy update endpoint and save it into `downloads/`:
+
+```bash
+make download
+```
+
+The script queries `https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-x64`, parses the `url` field in the returned JSON (a `.zip` bundle), swaps the `.zip` suffix for `.dmg` to get the DMG download address, and downloads it. If a DMG already exists in `downloads/`, the download is skipped.
+
+Additionally, `make install` now runs the full one-command chain: **auto-download latest DMG → build → package → install**:
+
+```bash
+make install
+```
+
+Override the update endpoint or platform via environment variables:
+
+```bash
+WB_UPDATE_API=https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-arm64 make download
+```
+
 ### Run the Generated Application
 
 ```bash
@@ -314,10 +374,19 @@ The following issues have been resolved via Linux runtime patches (`scripts/lib/
 7. **Tray icon completely missing on Wayland / modern panels (5.0.3+wb3)**: Electron defaults to `GtkStatusIcon` (X11 XEmbed), but Wayland sessions and panels like waybar, quickshell DMS, and KDE Plasma 6 only implement `StatusNotifierItem` (KDE SNI). XEmbed is a no-op there, so the app log says `trayActive=true, hasIcon=true` while the icon never registers on the bus and never shows up in the panel. **Fix**: `install.sh` writes a `start.sh` that prepends `Unity:` to `XDG_CURRENT_DESKTOP` (e.g. `Unity:XFCE`), which switches Electron to `ayatana-appindicator` (SNI). The original desktop name is preserved in the colon-separated list so other XDG-aware programs keep working.
 8. **First LLM call blocks for minutes when multiple connectors are enabled (5.0.3+wb3)**: Upstream codebuddy CLI's stdio MCP settle waits up to 30s per server serially. **Fix**: `start.sh` exports `MCP_TIMEOUT=3000` by default, paired with the `cliMcpSettleTimeoutInteractive` patch in `cli/dist/codebuddy.js`. Healthy servers respond in <1s, slow ones get skipped via the upstream `Promise.race`.
 9. **WorkBuddy App / Mini Program remote control requires manual re-enable after restart**: Upstream `ClawLifecycle.start()` restores saved channels and starts Centrifugo, but the `wechatmp` integration's default-enabled state can remain only in local config, while backend registration and remote subscription are not fully replayed after desktop restart. **Fix**: The Linux runtime patch delays and replays the enabled `wechatmp` integration after Claw lifecycle startup, writes the enabled state again, registers it with the backend, and starts Centrifugo so users no longer need to manually toggle "WeChat / Mini Program Integration" off and on after reopening the app.
+10. **Update-RPC anchor compatibility for v5.2.3+**: Upstream 5.2.3 renamed `registerUpdateHandlers(server, deps)` to `registerUpdateHandlers(registry, deps)` and `handleRpc$1` to `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)`. A missed anchor would skip the `updateRpcDisabled` patch and leave macOS/Windows updater menu items invoking unavailable code paths. **Fix**: The patch searches both the old and new signatures and injects the matching Linux no-op RPC stubs (`updateCheck` / `updateDownload` / `updateArchMismatchDownload` / `updateArchMismatchInstall` / `updateQuitAndInstall` / `updateGetState`); old versions behave exactly as before.
+11. **Network-diagnostics timeout patch downgraded to optional (v5.2.3+)**: Upstream removed the network diagnostics code in 5.2.3, so the previously *required* `networkDiagnosticsTimeouts` patch would abort the whole build when its anchor was missing. **Fix**: The patch is now `markOptional`, so a missing anchor only logs a warning and no longer stops the build.
 
 ## Version Compatibility
 
-The current patches have been verified against official WorkBuddy **4.22.10** (build `27634624-ec5e02bd`). Higher versions of the DMG may have upstream code structure changes that prevent patches from applying correctly. If you encounter build failures or runtime issues, please file an Issue in this repository with the DMG version number you are using.
+The current patches have been verified against official WorkBuddy **4.22.10** (build `27634624-ec5e02bd`), **5.0.3**, **5.1.1**, and **5.2.x** (tested 5.2.3 / 5.2.5). They auto-adapt to upstream code-structure changes:
+
+- **v5.2.3+ update-RPC anchor**: automatically detects both the old `registerUpdateHandlers(server, deps)` / `handleRpc$1(server, ...)` and the new `registerUpdateHandlers(registry, deps)` / `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)` signatures, injecting the matching Linux no-op RPC stubs.
+- **v5.2.3+ network-diagnostics timeout patch is now optional**: upstream removed the network diagnostics code in 5.2.3, so a missing anchor only warns instead of aborting the build.
+
+Higher DMG versions may still introduce structural changes that break patches; the build aborts when a *required* patch misses and writes `.workbuddy-linux/patch-report.json` on success. If you hit a build failure or runtime issue, please file an Issue with the DMG version you used.
+
+> **LoongArch (loong64)**: Tencent does not publish an official loong64 Electron. Provide a local runtime via `ELECTRON_LOCAL_ZIP=/path/to/electron-vX.Y.Z-linux-loong64.zip` (the version is auto-detected from the `electron-vX.Y.Z-*.zip` filename); native modules are rebuilt from source against it, and `@lydell/node-pty-linux-loong64` is synthesized by the build script from the rebuild output.
 
 ## Useful Custom Configurations
 
@@ -330,6 +399,12 @@ WORKBUDDY_INSTALL_DIR=/opt/tmp/workbuddy-app bash install.sh
 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ bash install.sh
 # Custom Electron headers download URL
 ELECTRON_HEADERS_URL=https://artifacts.electronjs.org/headers/dist bash install.sh
+# Use a local Electron runtime (for architectures without official binaries, e.g. loong64)
+ELECTRON_LOCAL_ZIP=/path/to/electron-v35.4.0-linux-loong64.zip bash install.sh
+# Override the npm registry (for native module rebuild / platform package install if the default mirror cannot proxy some packages)
+NPM_REGISTRY=https://registry.npmjs.org/ bash install.sh
+# Override the update endpoint / platform (used when make download / make install auto-fetch the DMG)
+WB_UPDATE_API=https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-arm64 make download
 ```
 
 ## Repository Maintenance Rules

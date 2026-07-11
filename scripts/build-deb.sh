@@ -16,7 +16,7 @@ CONTROL_TEMPLATE="$REPO_DIR/packaging/linux/control"
 
 map_arch() {
     case "$(dpkg --print-architecture)" in
-        amd64|arm64|armhf) dpkg --print-architecture ;;
+        amd64|arm64|armhf|loong64|loongarch64) dpkg --print-architecture ;;
         *) error "Unsupported Debian architecture: $(dpkg --print-architecture)" ;;
     esac
 }
@@ -68,6 +68,32 @@ EOF
         -e "s/__ARCH__/$arch/g" \
         "$CONTROL_TEMPLATE" > "$PKG_ROOT/DEBIAN/control"
     chmod 0644 "$PKG_ROOT/DEBIAN/control"
+
+    # postinst — refresh desktop database and icon cache so
+    # the start-menu entry appears immediately after install
+    cat > "$PKG_ROOT/DEBIAN/postinst" <<'MAINTAINER_SCRIPT'
+#!/bin/bash
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+fi
+MAINTAINER_SCRIPT
+    chmod 0755 "$PKG_ROOT/DEBIAN/postinst"
+
+    # postrm — refresh desktop database after uninstall
+    cat > "$PKG_ROOT/DEBIAN/postrm" <<'MAINTAINER_SCRIPT'
+#!/bin/bash
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications || true
+    fi
+fi
+MAINTAINER_SCRIPT
+    chmod 0755 "$PKG_ROOT/DEBIAN/postrm"
 
     mkdir -p "$DIST_DIR"
     dpkg-deb --root-owner-group --build "$PKG_ROOT" "$output_file" >&2

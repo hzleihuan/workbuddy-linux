@@ -48,7 +48,7 @@ if (!asarPath || !marker || !lydellPlatformPackage) {
     process.exit(2);
 }
 
-if (!/^@lydell\/node-pty-linux-(x64|arm64)$/.test(lydellPlatformPackage)) {
+if (!/^@lydell\/node-pty-linux-(x64|arm64|loong64)$/.test(lydellPlatformPackage)) {
     console.error('[apply-linux-patches] ERROR: unsupported @lydell platform package: ' + lydellPlatformPackage);
     process.exit(2);
 }
@@ -760,23 +760,33 @@ if (source.includes(marker)) {
     // Neutralize updateCheck / updateDownload / updateQuitAndInstall RPCs
     // on Linux so any residual UI button in the renderer becomes a no-op
     // instead of invoking the macOS/Windows updater code paths.
-    const updateRpcMarker = 'function registerUpdateHandlers(server, deps) {';
-    const updateRpcIdx = source.indexOf(updateRpcMarker);
+    const updateRpcMarkerOld = 'function registerUpdateHandlers(server, deps) {';
+    const updateRpcMarkerNew = 'function registerUpdateHandlers(registry, deps) {';
+    let updateRpcIdx = source.indexOf(updateRpcMarkerOld);
+    let useNewPattern = false;
+    if (updateRpcIdx < 0) {
+        updateRpcIdx = source.indexOf(updateRpcMarkerNew);
+        useNewPattern = true;
+    }
     if (updateRpcIdx >= 0) {
+        const marker = useNewPattern ? updateRpcMarkerNew : updateRpcMarkerOld;
+        const rpcFn = useNewPattern
+            ? 'require_workbuddy_auth_product_coordinator.handleRpc(registry,'
+            : 'handleRpc$1(server,';
         const linuxRpcShim =
-            updateRpcMarker + '\n' +
+            marker + '\n' +
             '\tif (process.platform === "linux") {\n' +
-            '\t\thandleRpc$1(server, "updateCheck", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateDownload", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateArchMismatchDownload", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateArchMismatchInstall", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateQuitAndInstall", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateGetState", async () => ({ state: "idle" }));\n' +
+            '\t\t' + rpcFn + ' "updateCheck", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateDownload", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateArchMismatchDownload", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateArchMismatchInstall", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateQuitAndInstall", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateGetState", async () => ({ state: "idle" }));\n' +
             '\t\treturn;\n' +
             '\t}';
         source = source.slice(0, updateRpcIdx)
             + linuxRpcShim
-            + source.slice(updateRpcIdx + updateRpcMarker.length);
+            + source.slice(updateRpcIdx + marker.length);
         markRequired('updateRpcDisabled', true);
     } else {
         markRequired('updateRpcDisabled', false);
@@ -1239,7 +1249,7 @@ if (source.includes(marker)) {
             markRequired('networkDiagnosticsTimeouts', true);
         } else {
             console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
-            markRequired('networkDiagnosticsTimeouts', false);
+            markOptional('networkDiagnosticsTimeouts', false);
         }
     }
 
@@ -1247,7 +1257,7 @@ if (source.includes(marker)) {
     log('patched main/index.js (env shim + tray context menu + tray icon path + disabled updater + linux stability timeouts + wechatmp plugin registration replay)');
 }
 
-if (!patchReport.required.networkDiagnosticsTimeouts) {
+if (!patchReport.required.networkDiagnosticsTimeouts && !patchReport.optional?.networkDiagnosticsTimeouts) {
     const runFrom =
         '\t\tconst [proxy, hosts, service, tcp, packetLoss] = await Promise.all([\n' +
         '\t\t\tthis.runProxyDiagnostics(proxyInfo),\n' +
@@ -1298,7 +1308,7 @@ if (!patchReport.required.networkDiagnosticsTimeouts) {
         markRequired('networkDiagnosticsTimeouts', true);
     } else {
         console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
-        markRequired('networkDiagnosticsTimeouts', false);
+        markOptional('networkDiagnosticsTimeouts', false);
     }
 }
 
@@ -1592,7 +1602,11 @@ if (fs.existsSync(lydellLinuxSrc) && !fs.existsSync(lydellLinuxDst)) {
 } else if (fs.existsSync(lydellLinuxDst)) {
     markRequired('lydellPlatformPackageRegistered', true);
 } else {
-    markRequired('lydellPlatformPackageRegistered', false);
+    // On architectures without a prebuilt @lydell/node-pty platform package
+    // (e.g. loong64), node-pty is rebuilt from source and the platform-
+    // package-specific require() hook is irrelevant. Mark optional so the
+    // build can proceed with source-built node-pty.
+    markOptional('lydellPlatformPackageRegistered', false);
 }
 
 // ---------------------------------------------------------------------------

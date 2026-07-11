@@ -34,6 +34,7 @@ map_arch() {
     case "${ARCH:-$(uname -m)}" in
         x86_64|amd64) echo "x86_64" ;;
         aarch64|arm64) echo "aarch64" ;;
+        loongarch64) echo "loongarch64" ;;
         *) error "Unsupported AppImage architecture: ${ARCH:-$(uname -m)}" ;;
     esac
 }
@@ -62,6 +63,7 @@ resolve_appimagetool() {
     case "$arch" in
         x86_64) url="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage}" ;;
         aarch64) url="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage}" ;;
+        loongarch64) error "appimagetool does not provide official loongarch64 binaries. Set APPIMAGETOOL_URL to a custom build, or use make deb instead." ;;
     esac
 
     info "Downloading appimagetool for $arch ..."

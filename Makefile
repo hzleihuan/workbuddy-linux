@@ -1,10 +1,11 @@
 SHELL := /bin/bash
 
-.PHONY: help deps build-app run-app deb rpm pacman appimage package install check clean
+.PHONY: help deps download build-app run-app deb rpm pacman appimage package install check clean
 
 help:
 	@echo "Targets:"
 	@echo "  make deps"
+	@echo "  make download              # fetch latest WorkBuddy DMG via official API"
 	@echo "  make build-app"
 	@echo "  make build-app DMG=/path/to/WorkBuddy.dmg"
 	@echo "  make run-app"
@@ -40,6 +41,9 @@ appimage:
 
 package:
 	bash scripts/package.sh
+
+download:
+	bash scripts/download-dmg.sh
 
 install:
 	bash scripts/install-package.sh

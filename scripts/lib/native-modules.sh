@@ -78,6 +78,7 @@ lydell_node_pty_linux_package() {
     case "$ARCH" in
         x86_64) echo "@lydell/node-pty-linux-x64" ;;
         aarch64) echo "@lydell/node-pty-linux-arm64" ;;
+        loongarch64) echo "@lydell/node-pty-linux-loong64" ;;
         *) return 1 ;;
     esac
 }
@@ -402,6 +403,11 @@ install_cli_ripgrep_linux() {
     case "$ARCH" in
         x86_64) linux_dir="x64-linux" ;;
         aarch64) linux_dir="arm64-linux" ;;
+        loongarch64)
+            # @vscode/ripgrep may not ship a loong64 binary on npm.
+            # Try the install anyway; if it fails, skip gracefully.
+            info "  loongarch64: attempting ripgrep install (may not have prebuilt binary)"
+            ;;
         *) warn "  No ripgrep binary for $ARCH"; return 0 ;;
     esac
 
@@ -429,17 +435,21 @@ install_cli_ripgrep_linux() {
     fi
 
     if [ -x "$rg_bin" ]; then
-        mkdir -p "$ripgrep_vendor/$linux_dir"
-        cp "$rg_bin" "$ripgrep_vendor/$linux_dir/rg"
-        chmod +x "$ripgrep_vendor/$linux_dir/rg"
-        info "  Installed Linux rg binary to cli/vendor/ripgrep/$linux_dir/"
+        if [ -z "${linux_dir:-}" ]; then
+            warn "  No target architecture dir for rg binary; skipping ripgrep vendor install"
+        else
+            mkdir -p "$ripgrep_vendor/$linux_dir"
+            cp "$rg_bin" "$ripgrep_vendor/$linux_dir/rg"
+            chmod +x "$ripgrep_vendor/$linux_dir/rg"
+            info "  Installed Linux rg binary to cli/vendor/ripgrep/$linux_dir/"
 
-        # Also check for ripgrep.node binding
-        local rg_node
-        rg_node="$(find "$build_dir/node_modules/@vscode/ripgrep" -name "ripgrep.node" -type f 2>/dev/null | head -1)"
-        if [ -n "$rg_node" ]; then
-            cp "$rg_node" "$ripgrep_vendor/$linux_dir/ripgrep.node"
-            info "  Installed Linux ripgrep.node to cli/vendor/ripgrep/$linux_dir/"
+            # Also check for ripgrep.node binding
+            local rg_node
+            rg_node="$(find "$build_dir/node_modules/@vscode/ripgrep" -name "ripgrep.node" -type f 2>/dev/null | head -1)"
+            if [ -n "$rg_node" ]; then
+                cp "$rg_node" "$ripgrep_vendor/$linux_dir/ripgrep.node"
+                info "  Installed Linux ripgrep.node to cli/vendor/ripgrep/$linux_dir/"
+            fi
         fi
     else
         warn "  Could not find rg binary after installing @vscode/ripgrep"
@@ -461,6 +471,43 @@ install_linux_platform_packages() {
     # Install @lydell/node-pty Linux package in cli/node_modules
     if [ -d "$app_dir/cli/node_modules/@lydell/node-pty" ]; then
         install_lydell_node_pty_linux "$app_dir/cli"
+    fi
+
+    # Loongarch64: create a synthetic @lydell/node-pty-linux-loong64 at the
+    # top-level node_modules using the node-pty binary rebuilt in Phase 3.
+    # This is required so that apply-linux-patches.js can find and copy the
+    # platform package into the asar during repack. npm does not publish
+    # @lydell/node-pty-linux-loong64, so we build it from the rebuild output.
+    if [ "$ARCH" = "loongarch64" ]; then
+        local pty_loong_pkg="$app_dir/node_modules/@lydell/node-pty-linux-loong64"
+        if [ ! -d "$pty_loong_pkg" ]; then
+            local pty_node="$app_dir/node_modules/node-pty/build/Release/pty.node"
+            if [ -f "$pty_node" ]; then
+                mkdir -p "$pty_loong_pkg/build/Release"
+                cp "$pty_node" "$pty_loong_pkg/build/Release/pty.node"
+                local pty_version="1.2.0-beta.12"
+                cat > "$pty_loong_pkg/package.json" << PKGJSON
+{
+  "name": "@lydell/node-pty-linux-loong64",
+  "version": "$pty_version",
+  "main": "index.js",
+  "os": ["linux"],
+  "cpu": ["loong64"]
+}
+PKGJSON
+                cat > "$pty_loong_pkg/index.js" << 'INDEXJS'
+// Synthetic platform package for loong64: load node-pty via absolute
+// filesystem path to bypass asar module resolution.
+var path = require("path");
+var resourcesPath = process.resourcesPath || path.dirname(process.execPath);
+var nodePtyPath = path.join(resourcesPath, "app.asar.unpacked", "node_modules", "node-pty");
+module.exports = require(nodePtyPath);
+INDEXJS
+                info "  Created synthetic top-level @lydell/node-pty-linux-loong64 from rebuilt binary"
+            else
+                warn "  Cannot find rebuilt node-pty binary for synthetic loong64 platform package"
+            fi
+        fi
     fi
 
     # Ensure the Linux @lydell/node-pty platform package is also in the top-level node_modules

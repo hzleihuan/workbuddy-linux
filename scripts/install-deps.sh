@@ -92,6 +92,14 @@ install_nodesource_nodejs() {
     apt_arch="$(dpkg --print-architecture)"
     case "$apt_arch" in
         amd64|arm64|armhf) ;;
+        loong64|loongarch64)
+            # NodeSource does not yet provide prebuilt packages for loong64.
+            # Fall back to whatever Node.js the distro provides.
+            info "NodeSource has no loong64 packages; using distro Node.js"
+            sudo apt-get install -y nodejs npm 2>/dev/null || \
+                error "Distro does not provide Node.js for loong64. Install Node.js $MIN_NODE_MAJOR+ manually."
+            return 0
+            ;;
         *) error "NodeSource does not support apt architecture: $apt_arch" ;;
     esac
 

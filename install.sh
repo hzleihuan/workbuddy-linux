@@ -31,6 +31,7 @@ Environment:
   WORKBUDDY_INSTALL_DIR     Output app directory (default: ./workbuddy-app)
   ELECTRON_MIRROR           Optional Electron runtime mirror
   ELECTRON_HEADERS_URL      Electron headers dist URL for native rebuilds
+  ELECTRON_LOCAL_ZIP        Path to local Electron zip (for unsupported arch, e.g. loong64)
   WORKBUDDY_DISABLE_SANDBOX Set to 1 to append --no-sandbox flags explicitly
   WORKBUDDY_LOCAL_MODE      Set to 1 to start the local CLI Web UI instead of Desktop
   WORKBUDDY_LOCAL_PORT      Local CLI Web UI port (default: 7890)
@@ -399,6 +400,10 @@ main() {
 
     prepare_install_dir
     download_electron_runtime
+    # Note: download_electron_runtime may update ELECTRON_VERSION when
+    # ELECTRON_LOCAL_ZIP is used (parses version from zip filename).
+    info "Using Electron: $ELECTRON_VERSION"
+
     copy_app_payload "$app_bundle"
 
     # Rebuild native modules in app.asar.unpacked (where the .node files live)
