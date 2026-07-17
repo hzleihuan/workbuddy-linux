@@ -157,7 +157,7 @@ WorkBuddy 基于 VS Code/Electron 开发，其 macOS 应用的 `app.asar` 文件
 
 ## 版本适配说明
 
-当前补丁基于官方 WorkBuddy **4.22.10**（构建号 `27634624-ec5e02bd`）、**5.0.3**（构建号 `30150715-f5a1d06d`）、**5.1.1**（构建号 `30799983-ecafd59f`）以及 **5.2.x**（实测 5.2.3 / 5.2.5）验证通过。5.x 使用 Electron 37.10.3，仍采用 `app.asar` + `app.asar.unpacked` 载荷结构。
+当前补丁基于官方 WorkBuddy **4.22.10**（构建号 `27634624-ec5e02bd`）、**5.0.3**（构建号 `30150715-f5a1d06d`）、**5.1.1**（构建号 `30799983-ecafd59f`）以及 **5.2.x**（实测 5.2.3 / 5.2.5 / 5.2.6）验证通过。5.x 使用 Electron 37.10.3，仍采用 `app.asar` + `app.asar.unpacked` 载荷结构。
 
 补丁对上游不同代码结构做了自动适配：
 - **v5.2.3+ 更新 RPC 锚点**：自动识别 `registerUpdateHandlers(server, deps)` / `handleRpc$1(server, ...)`（旧）与 `registerUpdateHandlers(registry, deps)` / `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)`（新）两套签名并分别注入对应的 Linux no-op RPC 桩；
@@ -379,7 +379,7 @@ The following issues have been resolved via Linux runtime patches (`scripts/lib/
 
 ## Version Compatibility
 
-The current patches have been verified against official WorkBuddy **4.22.10** (build `27634624-ec5e02bd`), **5.0.3**, **5.1.1**, and **5.2.x** (tested 5.2.3 / 5.2.5). They auto-adapt to upstream code-structure changes:
+The current patches have been verified against official WorkBuddy **4.22.10** (build `27634624-ec5e02bd`), **5.0.3**, **5.1.1**, and **5.2.x** (tested 5.2.3 / 5.2.5 / 5.2.6). They auto-adapt to upstream code-structure changes:
 
 - **v5.2.3+ update-RPC anchor**: automatically detects both the old `registerUpdateHandlers(server, deps)` / `handleRpc$1(server, ...)` and the new `registerUpdateHandlers(registry, deps)` / `require_workbuddy_auth_product_coordinator.handleRpc(registry, ...)` signatures, injecting the matching Linux no-op RPC stubs.
 - **v5.2.3+ network-diagnostics timeout patch is now optional**: upstream removed the network diagnostics code in 5.2.3, so a missing anchor only warns instead of aborting the build.

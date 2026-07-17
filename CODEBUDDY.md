@@ -118,7 +118,7 @@ Each patch is either **required** (build fails if anchor not matched) or **optio
 
 ### Versioning and compatibility
 
-The project tracks upstream DMG versions in `CHANGELOG.md` using `<upstream-version>+wb<iteration>` format. Currently verified against DMG versions 4.22.10, 5.0.3, and 5.1.1. When a new upstream DMG is released, patch anchors in `apply-linux-patches.js` may break — the build will fail on missing required patches or warn on missing optional ones. Upgraders should check `patch-report.json` after building and adjust anchor strings in the patcher.
+The project tracks upstream DMG versions in `CHANGELOG.md` using `<upstream-version>+wb<iteration>` format. Currently verified against DMG versions 4.22.10, 5.0.3, 5.1.1, 5.2.3, 5.2.5, and 5.2.6. When a new upstream DMG is released, patch anchors in `apply-linux-patches.js` may break — the build will fail on missing required patches or warn on missing optional ones. Upgraders should check `patch-report.json` after building and adjust anchor strings in the patcher.
 
 ### Architecture support
 
