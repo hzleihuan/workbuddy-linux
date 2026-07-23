@@ -98,3 +98,17 @@ download_electron_runtime() {
     rm -rf "$lock_dir"
     trap - RETURN
 }
+
+# Parse the Electron version out of a local zip file path of the form
+# electron-vX.Y.Z-linux-<arch>.zip. Returns the version on stdout, or nothing
+# if the pattern does not match.
+parse_electron_version_from_path() {
+    local path="$1"
+    case "$path" in
+        *electron-v[0-9]*\.*[0-9]*\.*[0-9]*-linux-*.zip)
+            local v="${path#*electron-v}"
+            v="${v%%-linux-*}"
+            echo "$v"
+            ;;
+    esac
+}

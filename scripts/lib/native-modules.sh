@@ -403,11 +403,7 @@ install_cli_ripgrep_linux() {
     case "$ARCH" in
         x86_64) linux_dir="x64-linux" ;;
         aarch64) linux_dir="arm64-linux" ;;
-        loongarch64)
-            # @vscode/ripgrep may not ship a loong64 binary on npm.
-            # Try the install anyway; if it fails, skip gracefully.
-            info "  loongarch64: attempting ripgrep install (may not have prebuilt binary)"
-            ;;
+        loongarch64) linux_dir="loong64-linux" ;;
         *) warn "  No ripgrep binary for $ARCH"; return 0 ;;
     esac
 

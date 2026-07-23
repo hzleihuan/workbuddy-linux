@@ -393,6 +393,7 @@ main() {
 
     info "Using app bundle: $app_bundle"
     info "Using Electron: $ELECTRON_VERSION"
+    info "Using architecture: $ARCH"
     info "Upstream version: $upstream_version (full: $full_version)"
 
     # Export for downstream packaging scripts

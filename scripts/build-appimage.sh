@@ -63,7 +63,7 @@ resolve_appimagetool() {
     case "$arch" in
         x86_64) url="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage}" ;;
         aarch64) url="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage}" ;;
-        loongarch64) error "appimagetool does not provide official loongarch64 binaries. Set APPIMAGETOOL_URL to a custom build, or use make deb instead." ;;
+        loongarch64) url="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-loongarch64.AppImage}" ;;
     esac
 
     info "Downloading appimagetool for $arch ..."

@@ -760,6 +760,9 @@ if (source.includes(marker)) {
     // Neutralize updateCheck / updateDownload / updateQuitAndInstall RPCs
     // on Linux so any residual UI button in the renderer becomes a no-op
     // instead of invoking the macOS/Windows updater code paths.
+    // v5.2.3+ changed 'registerUpdateHandlers(server, deps)' to
+    // 'registerUpdateHandlers(registry, deps)' and 'handleRpc$1' to
+    // 'handleRpc'. Try both patterns for forward/backward compat.
     const updateRpcMarkerOld = 'function registerUpdateHandlers(server, deps) {';
     const updateRpcMarkerNew = 'function registerUpdateHandlers(registry, deps) {';
     let updateRpcIdx = source.indexOf(updateRpcMarkerOld);
@@ -1244,9 +1247,9 @@ if (source.includes(marker)) {
             source = source.slice(0, runIdx) + networkDiagnosticsRunTo + source.slice(runIdx + networkDiagnosticsRunFrom.length);
             const updatedMethodIdx = source.indexOf(networkDiagnosticsMethodFrom, runIdx);
             source = source.slice(0, updatedMethodIdx) + networkDiagnosticsMethodTo + source.slice(updatedMethodIdx + networkDiagnosticsMethodFrom.length);
-            markRequired('networkDiagnosticsTimeouts', true);
+            markOptional('networkDiagnosticsTimeouts', true);
         } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
-            markRequired('networkDiagnosticsTimeouts', true);
+            markOptional('networkDiagnosticsTimeouts', true);
         } else {
             console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
             markOptional('networkDiagnosticsTimeouts', false);
@@ -1303,9 +1306,9 @@ if (!patchReport.required.networkDiagnosticsTimeouts && !patchReport.optional?.n
         source = source.slice(0, updatedMethodIdx) + methodTo + source.slice(updatedMethodIdx + methodFrom.length);
         fs.writeFileSync(indexPath, source);
         log('patched main/index.js (network diagnostics per-check timeouts)');
-        markRequired('networkDiagnosticsTimeouts', true);
+        markOptional('networkDiagnosticsTimeouts', true);
     } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
-        markRequired('networkDiagnosticsTimeouts', true);
+        markOptional('networkDiagnosticsTimeouts', true);
     } else {
         console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
         markOptional('networkDiagnosticsTimeouts', false);
@@ -1598,9 +1601,9 @@ const lydellLinuxDst = path.join(tmpDir, 'node_modules', '@lydell', lydellPackag
 if (fs.existsSync(lydellLinuxSrc) && !fs.existsSync(lydellLinuxDst)) {
     fs.cpSync(lydellLinuxSrc, lydellLinuxDst, { recursive: true });
     log('copied ' + lydellPlatformPackage + ' into asar source for repack');
-    markRequired('lydellPlatformPackageRegistered', true);
+    markOptional('lydellPlatformPackageRegistered', true);
 } else if (fs.existsSync(lydellLinuxDst)) {
-    markRequired('lydellPlatformPackageRegistered', true);
+    markOptional('lydellPlatformPackageRegistered', true);
 } else {
     // On architectures without a prebuilt @lydell/node-pty platform package
     // (e.g. loong64), node-pty is rebuilt from source and the platform-

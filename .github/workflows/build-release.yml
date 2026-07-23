@@ -1,242 +1,197 @@
-name: Build & Release from DMG
-#
-# Manual workflow that:
-#   1. Downloads the official WorkBuddy macOS DMG from a user-provided URL
-#   2. Runs the full Linux porting pipeline (extract, patch, rebuild)
-#   3. Packages into .deb, .rpm, .AppImage
-#   4. Creates a GitHub Release with version matching the DMG
-#
-# Usage:
-#   1. Go to Actions → "Build & Release from DMG" → "Run workflow"
-#   2. Paste the DMG download URL
-#   3. Wait ~15–20 minutes for the build to finish
-#   4. Review the draft release and publish it manually
-#
-# The DMG URL must be a *direct* download (no interstitial page).
-# If the official site requires authentication cookies, pass them via
-# COOKIE_HEADER or DMG_URL using signed CloudFront / S3 pre-signed URLs.
+name: Build & Release WorkBuddy Linux
 
 on:
   workflow_dispatch:
     inputs:
       dmg_url:
-        description: 'Direct download URL to the official WorkBuddy macOS x64 DMG'
-        required: true
-        type: string
-      dmg_filename:
-        description: 'DMG filename override (default: auto-detected from URL)'
+        description: 'DMG URL (empty = auto-fetch latest)'
         required: false
         type: string
         default: ''
 
-env:
-  # Upload intermediate artifacts even on failure for debugging
-  ARTIFACT_RETENTION_DAYS: 7
-
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
-      contents: write    # needed to create Release + upload assets
+      contents: write
 
     steps:
-      # --------------------------------------------------------------
-      # 1. Checkout
-      # --------------------------------------------------------------
+      # ── 1. Checkout ──────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # --------------------------------------------------------------
-      # 2. Download DMG
-      # --------------------------------------------------------------
-      - name: Download official DMG
-        id: download
-        env:
-          DMG_URL: ${{ inputs.dmg_url }}
-          DMG_FILENAME: ${{ inputs.dmg_filename }}
+      # ── 2. Resolve version & download DMG ────────────────────
+      - name: Resolve version and download DMG
+        id: dmg
         run: |
+          set -euo pipefail
           mkdir -p downloads
 
-          URL="$DMG_URL"
-          FILENAME="$DMG_FILENAME"
-
-          if [ -z "$FILENAME" ]; then
-            FILENAME="${URL##*/}"
-            FILENAME="${FILENAME%%\?*}"
-          fi
-          [ -n "$FILENAME" ] || FILENAME="WorkBuddy.dmg"
-          FILENAME="$(basename "$FILENAME")"
-          if ! printf '%s' "$FILENAME" | grep -Eq '^[A-Za-z0-9._ -]+\.dmg$'; then
-            echo "ERROR: unsafe DMG filename: $FILENAME"
-            exit 1
+          USER_URL="${{ inputs.dmg_url }}"
+          if [ -n "$USER_URL" ] && [ "$USER_URL" != "null" ]; then
+            DMG_URL="$USER_URL"
+          else
+            echo "::group::Fetching latest version from API"
+            API_JSON=$(curl -sL "https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-x64")
+            echo "API response: $API_JSON"
+            ZIP_URL=$(echo "$API_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['url'])")
+            DMG_URL="${ZIP_URL%.zip}.dmg"
+            echo "::endgroup::"
           fi
 
-          echo "Downloading DMG from: $URL"
-          echo "  → saving as: downloads/$FILENAME"
+          DMG_FILE="downloads/WorkBuddy.dmg"
+          echo "Downloading: $DMG_URL"
+          curl -fSL --retry 3 --retry-delay 10 -o "$DMG_FILE" "$DMG_URL"
+          ls -lh "$DMG_FILE"
 
-          curl -fSL --retry 3 --retry-delay 10 \
-            -o "downloads/$FILENAME" \
-            "$URL"
+          # Extract version from filename
+          BASENAME="${DMG_URL##*/}"
+          VERSION=$(echo "$BASENAME" | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dmg_file=$DMG_FILE" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
 
-          ls -lh "downloads/$FILENAME"
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "filesize=$(stat -c%s 'downloads/$FILENAME')" >> "$GITHUB_OUTPUT"
-
-      # --------------------------------------------------------------
-      # 3. Install build deps
-      # --------------------------------------------------------------
+      # ── 3. Install system dependencies ───────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            p7zip-full \
-            curl \
-            nodejs \
-            npm \
-            dpkg-dev \
-            rpm \
-            zstd
-          # Verify key tools
-          node --version
-          npm --version
-          python3 --version
-          7z --help >/dev/null 2>&1 && echo "7z OK"
+            p7zip-full curl nodejs npm python3 \
+            dpkg-dev rpm squashfs-tools zstd \
+            libx11-dev libxkbfile-dev libsecret-1-dev libglib2.0-dev \
+            pkg-config make g++
 
-      # --------------------------------------------------------------
-      # 4. Build WorkBuddy for Linux
-      # --------------------------------------------------------------
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+
+      # ── 4. Build WorkBuddy Linux app ────────────────────────
       - name: Build WorkBuddy Linux app
-        run: |
-          make build-app DMG="downloads/${{ steps.download.outputs.filename }}"
         env:
-          # Speed up Electron download
-          ELECTRON_MIRROR: "https://github.com/electron/electron/releases/download/"
-
-      # --------------------------------------------------------------
-      # 5. Read upstream version for release tag
-      # --------------------------------------------------------------
-      - name: Read upstream version
-        id: version
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
         run: |
-          BUILD_INFO="workbuddy-app/.workbuddy-linux/build-info.json"
-          if [ ! -f "$BUILD_INFO" ]; then
-            echo "ERROR: build-info.json not found"
-            exit 1
+          set -Eeuo pipefail
+          echo "=== Building from ${{ steps.dmg.outputs.dmg_file }} ==="
+          bash install.sh "${{ steps.dmg.outputs.dmg_file }}"
+          echo "=== Build complete ==="
+
+      # ── 5. Build DEB ────────────────────────────────────────
+      - name: Package DEB
+        run: |
+          bash scripts/build-deb.sh
+          ls -lh dist/*.deb
+
+      # ── 6. Build AppImage (mksquashfs, no FUSE) ─────────────
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.dmg.outputs.version }}"
+          APPDIR="dist/AppDir"
+          APP_ID="workbuddy"
+
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/opt/$APP_ID" \
+                   "$APPDIR/usr/bin" \
+                   "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+          cp -a workbuddy-app/. "$APPDIR/opt/$APP_ID/"
+
+          # AppRun
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          APPDIR="$(dirname "$(readlink -f "$0")")"
+          export CHROME_DESKTOP="workbuddy.desktop"
+          export ELECTRON_FORCE_IS_PACKAGED=1
+          export XDG_CURRENT_DESKTOP="Unity:${XDG_CURRENT_DESKTOP:-}"
+          unset ELECTRON_RUN_AS_NODE 2>/dev/null || true
+          exec "$APPDIR/opt/workbuddy/electron" \
+            --disable-dev-shm-usage --in-process-gpu \
+            --ozone-platform-hint=auto --enable-wayland-ime \
+            --no-sandbox --disable-gpu-sandbox "$@"
+          EOF
+          chmod 0755 "$APPDIR/AppRun"
+
+          # Desktop entry
+          cat > "$APPDIR/$APP_ID.desktop" <<EOF
+          [Desktop Entry]
+          Name=WorkBuddy
+          Comment=AI Agent Desktop Application
+          Exec=opt/workbuddy/start.sh %F
+          Icon=workbuddy
+          Type=Application
+          Categories=Development;IDE;
+          StartupNotify=true
+          EOF
+          cp "$APPDIR/$APP_ID.desktop" "$APPDIR/usr/share/applications/"
+
+          # Icon
+          if [ -f workbuddy-app/.workbuddy-linux/workbuddy.png ]; then
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/workbuddy.png"
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/.DirIcon"
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/"
           fi
 
-          # Extract version fields via single-line Python commands
-          python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('upstreamVersion','unknown'))" "$BUILD_INFO" > /tmp/upstream_version.txt
-          python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('fullVersion',d.get('upstreamVersion','unknown')))" "$BUILD_INFO" > /tmp/full_version.txt
+          # Download runtime + build squashfs AppImage
+          curl -fsSL -o dist/runtime-x86_64 \
+            "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+          chmod +x dist/runtime-x86_64
 
-          UPSTREAM_VERSION="$(cat /tmp/upstream_version.txt)"
-          FULL_VERSION="$(cat /tmp/full_version.txt)"
+          OUTPUT="dist/WorkBuddy-${VERSION}-x86_64.AppImage"
+          mksquashfs "$APPDIR" "${OUTPUT}.squashfs" -noappend -comp gzip -root-owned -no-xattrs
+          cat dist/runtime-x86_64 "${OUTPUT}.squashfs" > "$OUTPUT"
+          chmod +x "$OUTPUT"
+          rm -f "${OUTPUT}.squashfs"
+          ls -lh "$OUTPUT"
 
-          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
-          echo "full_version=$FULL_VERSION"          >> "$GITHUB_OUTPUT"
-          echo "tag=v${FULL_VERSION}"                >> "$GITHUB_OUTPUT"
-          echo "Project version: $UPSTREAM_VERSION"
-          echo "Release tag:     v$FULL_VERSION"
-
-      # --------------------------------------------------------------
-      # 6. Package all distribution formats
-      # --------------------------------------------------------------
-      - name: Package distributions
-        id: package
+      # ── 7. Build RPM (best-effort) ──────────────────────────
+      - name: Package RPM
+        continue-on-error: true
         run: |
-          mkdir -p dist
+          if command -v rpmbuild >/dev/null 2>&1; then
+            bash scripts/build-rpm.sh || echo "RPM build failed"
+          else
+            echo "rpmbuild not available, skipping"
+          fi
 
-          # .deb (always available on Ubuntu)
-          echo "::group::Building .deb"
-          make deb
-          echo "::endgroup::"
-
-          # .AppImage (auto-downloads appimagetool; may flag FUSE warnings)
-          echo "::group::Building .AppImage"
-          make appimage
-          echo "::endgroup::"
-
-          # .rpm (best-effort; requires rpmbuild from the rpm package)
-          echo "::group::Building .rpm"
-          bash scripts/build-rpm.sh && echo "RPM OK" || echo "RPM SKIPPED"
-          echo "::endgroup::"
-
-          # Arch Linux pacman package (built directly; no makepkg needed on Ubuntu)
-          echo "::group::Building Arch pacman package"
-          bash scripts/build-pacman.sh && echo "PACMAN OK" || echo "PACMAN SKIPPED"
-          echo "::endgroup::"
-
-          # Show what we got
-          echo "::group::Artifacts"
-          ls -lh dist/
-          echo "::endgroup::"
-
-      # --------------------------------------------------------------
-      # 7. Upload artifacts as build output (always, even if release fails)
-      # --------------------------------------------------------------
-      - name: Upload distribution artifacts
+      # ── 8. Upload artifacts ─────────────────────────────────
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: WorkBuddy-${{ steps.version.outputs.upstream_version }}
+          name: WorkBuddy-Linux-${{ steps.dmg.outputs.version }}
           path: |
             dist/*.deb
             dist/*.rpm
-            dist/*.pkg.tar.zst
             dist/*.AppImage
-          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          retention-days: 7
 
-      # --------------------------------------------------------------
-      # 8. Create GitHub Release
-      # --------------------------------------------------------------
-      - name: Create Release
+      # ── 9. Create Release ───────────────────────────────────
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: WorkBuddy v${{ steps.version.outputs.upstream_version }}
+          tag_name: v${{ steps.dmg.outputs.version }}
+          name: WorkBuddy v${{ steps.dmg.outputs.version }} Linux
           body: |
-            ## WorkBuddy Linux 移植版
+            ## WorkBuddy v${{ steps.dmg.outputs.version }} — Linux 移植版
 
-            | 元数据 | 值 |
-            |---|---|
-            | 上游版本 | `${{ steps.version.outputs.upstream_version }}` |
-            | 完整版本 | `${{ steps.version.outputs.full_version }}` |
-            | 构建日期 | $(date -u +%Y-%m-%d) |
-            | 构建环境 | GitHub Actions (${{ github.run_id }}) |
+            自动从官方 macOS DMG 构建，适用于 x86_64 Linux。
 
-            ### 安装包说明
-
-            | 文件 | 格式 | 适用发行版 |
+            | 文件 | 格式 | 适用系统 |
             |---|---|---|
-            | `*_amd64.deb` | Debian | Ubuntu, Debian, Linux Mint, 等 |
-            | `*.x86_64.rpm` | RPM | Fedora, RHEL, openSUSE, 等 |
-            | `*.pkg.tar.zst` | Pacman | Arch Linux, Manjaro, EndeavourOS, 等 |
-            | `*-x86_64.AppImage` | AppImage | 任何 Linux 发行版（便携，无需安装） |
-
-            ### 使用方法
+            | `*_amd64.deb` | Debian | Ubuntu / Debian / Mint |
+            | `*.x86_64.rpm` | RPM | Fedora / RHEL / openSUSE |
+            | `*-x86_64.AppImage` | AppImage | 通用 Linux（免安装） |
 
             ```bash
             # Debian/Ubuntu
             sudo dpkg -i workbuddy_*_amd64.deb
-
-            # Fedora/RHEL
-            sudo rpm -ivh workbuddy-*.x86_64.rpm
-
-            # Arch Linux
-            sudo pacman -U workbuddy-*.pkg.tar.zst
-
-            # AppImage（任何发行版）
-            chmod +x WorkBuddy-*.AppImage
-            ./WorkBuddy-*.AppImage
+            # AppImage
+            chmod +x WorkBuddy-*.AppImage && ./WorkBuddy-*.AppImage
             ```
 
-            ### 注意事项
-
-            - 本版本由 [workbuddy-linux](https://github.com/$(echo "${{ github.repository }}")) 自动构建。
-            - 这是非官方移植版，**禁止通过官方渠道反馈 Linux 相关 Bug**。
-            - 如需升级，请下载新版官方 DMG 后在本仓库重新发起工作流。
-            - 此 Release 为 **Draft** 状态，确认无误后请手动发布。
+            > 非官方移植，请勿向官方反馈 Linux Bug。
           files: |
             dist/*.deb
             dist/*.rpm
-            dist/*.pkg.tar.zst
             dist/*.AppImage
           draft: true
           generate_release_notes: true
