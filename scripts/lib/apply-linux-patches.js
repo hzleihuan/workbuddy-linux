@@ -760,23 +760,36 @@ if (source.includes(marker)) {
     // Neutralize updateCheck / updateDownload / updateQuitAndInstall RPCs
     // on Linux so any residual UI button in the renderer becomes a no-op
     // instead of invoking the macOS/Windows updater code paths.
-    const updateRpcMarker = 'function registerUpdateHandlers(server, deps) {';
-    const updateRpcIdx = source.indexOf(updateRpcMarker);
+    // v5.2.3+ changed 'registerUpdateHandlers(server, deps)' to
+    // 'registerUpdateHandlers(registry, deps)' and 'handleRpc$1' to
+    // 'handleRpc'. Try both patterns for forward/backward compat.
+    const updateRpcMarkerOld = 'function registerUpdateHandlers(server, deps) {';
+    const updateRpcMarkerNew = 'function registerUpdateHandlers(registry, deps) {';
+    let updateRpcIdx = source.indexOf(updateRpcMarkerOld);
+    let useNewPattern = false;
+    if (updateRpcIdx < 0) {
+        updateRpcIdx = source.indexOf(updateRpcMarkerNew);
+        useNewPattern = true;
+    }
     if (updateRpcIdx >= 0) {
+        const marker = useNewPattern ? updateRpcMarkerNew : updateRpcMarkerOld;
+        const rpcFn = useNewPattern
+            ? 'require_workbuddy_auth_product_coordinator.handleRpc(registry,'
+            : 'handleRpc$1(server,';
         const linuxRpcShim =
-            updateRpcMarker + '\n' +
+            marker + '\n' +
             '\tif (process.platform === "linux") {\n' +
-            '\t\thandleRpc$1(server, "updateCheck", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateDownload", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateArchMismatchDownload", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateArchMismatchInstall", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateQuitAndInstall", async () => {});\n' +
-            '\t\thandleRpc$1(server, "updateGetState", async () => ({ state: "idle" }));\n' +
+            '\t\t' + rpcFn + ' "updateCheck", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateDownload", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateArchMismatchDownload", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateArchMismatchInstall", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateQuitAndInstall", async () => {});\n' +
+            '\t\t' + rpcFn + ' "updateGetState", async () => ({ state: "idle" }));\n' +
             '\t\treturn;\n' +
             '\t}';
         source = source.slice(0, updateRpcIdx)
             + linuxRpcShim
-            + source.slice(updateRpcIdx + updateRpcMarker.length);
+            + source.slice(updateRpcIdx + marker.length);
         markRequired('updateRpcDisabled', true);
     } else {
         markRequired('updateRpcDisabled', false);
@@ -1234,12 +1247,12 @@ if (source.includes(marker)) {
             source = source.slice(0, runIdx) + networkDiagnosticsRunTo + source.slice(runIdx + networkDiagnosticsRunFrom.length);
             const updatedMethodIdx = source.indexOf(networkDiagnosticsMethodFrom, runIdx);
             source = source.slice(0, updatedMethodIdx) + networkDiagnosticsMethodTo + source.slice(updatedMethodIdx + networkDiagnosticsMethodFrom.length);
-            markRequired('networkDiagnosticsTimeouts', true);
+            markOptional('networkDiagnosticsTimeouts', true);
         } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
-            markRequired('networkDiagnosticsTimeouts', true);
+            markOptional('networkDiagnosticsTimeouts', true);
         } else {
             console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
-            markRequired('networkDiagnosticsTimeouts', false);
+            markOptional('networkDiagnosticsTimeouts', false);
         }
     }
 
@@ -1247,7 +1260,7 @@ if (source.includes(marker)) {
     log('patched main/index.js (env shim + tray context menu + tray icon path + disabled updater + linux stability timeouts + wechatmp plugin registration replay)');
 }
 
-if (!patchReport.required.networkDiagnosticsTimeouts) {
+if (!patchReport.required.networkDiagnosticsTimeouts && !patchReport.optional?.networkDiagnosticsTimeouts) {
     const runFrom =
         '\t\tconst [proxy, hosts, service, tcp, packetLoss] = await Promise.all([\n' +
         '\t\t\tthis.runProxyDiagnostics(proxyInfo),\n' +
@@ -1293,12 +1306,12 @@ if (!patchReport.required.networkDiagnosticsTimeouts) {
         source = source.slice(0, updatedMethodIdx) + methodTo + source.slice(updatedMethodIdx + methodFrom.length);
         fs.writeFileSync(indexPath, source);
         log('patched main/index.js (network diagnostics per-check timeouts)');
-        markRequired('networkDiagnosticsTimeouts', true);
+        markOptional('networkDiagnosticsTimeouts', true);
     } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
-        markRequired('networkDiagnosticsTimeouts', true);
+        markOptional('networkDiagnosticsTimeouts', true);
     } else {
         console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
-        markRequired('networkDiagnosticsTimeouts', false);
+        markOptional('networkDiagnosticsTimeouts', false);
     }
 }
 
