@@ -1,240 +1,118 @@
 name: Build & Release WorkBuddy Linux
 
-# ──────────────────────────────────────────────────────────────
-# Triggers:
-#   - Manual dispatch (with optional DMG URL override)
-#   - Scheduled daily check for new upstream versions
-# ──────────────────────────────────────────────────────────────
 on:
   workflow_dispatch:
     inputs:
       dmg_url:
-        description: 'DMG download URL (leave empty to auto-fetch latest)'
+        description: 'DMG URL (empty = auto-fetch latest)'
         required: false
         type: string
         default: ''
-      electron_mirror:
-        description: 'Electron download mirror'
-        required: false
-        type: string
-        default: 'https://npmmirror.com/mirrors/electron/'
-
-env:
-  ARTIFACT_RETENTION_DAYS: 7
-  ELECTRON_MIRROR_DEFAULT: 'https://npmmirror.com/mirrors/electron/'
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════
-  # Job 1: Resolve upstream version & download DMG
-  # ═══════════════════════════════════════════════════════════════
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.resolve.outputs.version }}
-      dmg_filename: ${{ steps.resolve.outputs.dmg_filename }}
-      dmg_url: ${{ steps.resolve.outputs.dmg_url }}
-    steps:
-      - name: Resolve latest WorkBuddy version
-        id: resolve
-        run: |
-          # If user provided a URL, use it directly
-          if [ -n "${{ inputs.dmg_url }}" ]; then
-            URL="${{ inputs.dmg_url }}"
-            FILENAME="${URL##*/}"
-            FILENAME="${FILENAME%%\?*}"
-            VERSION="${FILENAME}" 
-            # Try to extract version from filename: WorkBuddy-darwin-x64-5.2.6.xxx-dmg
-            VERSION=$(echo "$FILENAME" | grep -oP '\d+\.\d+\.\d+' | head -1 || true)
-            [ -n "$VERSION" ] || VERSION="unknown"
-            echo "Using user-provided URL"
-          else
-            # Auto-fetch latest from API
-            echo "Fetching latest version from API..."
-            API_RESPONSE=$(curl -sL "https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-x64")
-            echo "API response: $API_RESPONSE"
-            
-            VERSION=$(echo "$API_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")
-            ZIP_URL=$(echo "$API_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['url'])")
-            # Convert .zip URL to .dmg URL
-            URL="${ZIP_URL%.zip}.dmg"
-            FILENAME="WorkBuddy-darwin-x64-${VERSION}.dmg"
-            echo "Auto-detected version: $VERSION"
-          fi
-          
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "dmg_filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "dmg_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "DMG URL: $URL"
-          echo "Filename: $FILENAME"
-          echo "Version: $VERSION"
-
-      - name: Download DMG
-        run: |
-          mkdir -p downloads
-          curl -fSL --retry 3 --retry-delay 10 \
-            -o "downloads/${{ steps.resolve.outputs.dmg_filename }}" \
-            "${{ steps.resolve.outputs.dmg_url }}"
-          ls -lh "downloads/"
-
-      - name: Upload DMG as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dmg-input
-          path: downloads/*.dmg
-          retention-days: 1
-
-  # ═══════════════════════════════════════════════════════════════
-  # Job 2: Build the Linux app
-  # ═══════════════════════════════════════════════════════════════
-  build:
+  build-and-release:
     runs-on: ubuntu-22.04
-    needs: prepare
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      DMG_FILENAME: ${{ needs.prepare.outputs.dmg_filename }}
-      ELECTRON_MIRROR: ${{ inputs.electron_mirror || 'https://npmmirror.com/mirrors/electron/' }}
+    permissions:
+      contents: write
+
     steps:
-      # ─────────────────────────────────────────────────────────
-      # 1. Checkout
-      # ─────────────────────────────────────────────────────────
+      # ── 1. Checkout ──────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────────────────────
-      # 2. Download DMG artifact
-      # ─────────────────────────────────────────────────────────
-      - name: Download DMG
-        uses: actions/download-artifact@v4
-        with:
-          name: dmg-input
-          path: downloads/
+      # ── 2. Resolve version & download DMG ────────────────────
+      - name: Resolve version and download DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          mkdir -p downloads
 
-      # ─────────────────────────────────────────────────────────
-      # 3. Install system dependencies
-      # ─────────────────────────────────────────────────────────
+          USER_URL="${{ inputs.dmg_url }}"
+          if [ -n "$USER_URL" ] && [ "$USER_URL" != "null" ]; then
+            DMG_URL="$USER_URL"
+          else
+            echo "::group::Fetching latest version from API"
+            API_JSON=$(curl -sL "https://www.codebuddy.cn/v2/update?platform=workbuddy-darwin-x64")
+            echo "API response: $API_JSON"
+            ZIP_URL=$(echo "$API_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['url'])")
+            DMG_URL="${ZIP_URL%.zip}.dmg"
+            echo "::endgroup::"
+          fi
+
+          DMG_FILE="downloads/WorkBuddy.dmg"
+          echo "Downloading: $DMG_URL"
+          curl -fSL --retry 3 --retry-delay 10 -o "$DMG_FILE" "$DMG_URL"
+          ls -lh "$DMG_FILE"
+
+          # Extract version from filename
+          BASENAME="${DMG_URL##*/}"
+          VERSION=$(echo "$BASENAME" | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dmg_file=$DMG_FILE" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      # ── 3. Install system dependencies ───────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            p7zip-full \
-            curl \
-            nodejs \
-            npm \
-            python3 \
-            dpkg-dev \
-            rpm \
-            squashfs-tools \
-            libx11-dev \
-            libxkbfile-dev \
-            libsecret-1-dev \
-            libglib2.0-dev \
-            pkg-config \
-            make \
-            g++ \
-            zstd
-          
-          echo "=== Installed tools ==="
-          node --version
-          npm --version
-          python3 --version
-          which mksquashfs && echo "mksquashfs: OK"
-          which 7z && echo "7z: OK"
-          which rpmbuild && echo "rpmbuild: OK"
+            p7zip-full curl nodejs npm python3 \
+            dpkg-dev rpm squashfs-tools zstd \
+            libx11-dev libxkbfile-dev libsecret-1-dev libglib2.0-dev \
+            pkg-config make g++
 
-      # ─────────────────────────────────────────────────────────
-      # 4. Build WorkBuddy Linux app
-      # ─────────────────────────────────────────────────────────
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+
+      # ── 4. Build WorkBuddy Linux app ────────────────────────
       - name: Build WorkBuddy Linux app
+        env:
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
         run: |
           set -Eeuo pipefail
-          
-          echo "=== Building WorkBuddy Linux v${VERSION} ==="
-          echo "DMG: downloads/${DMG_FILENAME}"
-          
-          # Run the main build script
-          bash install.sh "downloads/${DMG_FILENAME}"
-          
+          echo "=== Building from ${{ steps.dmg.outputs.dmg_file }} ==="
+          bash install.sh "${{ steps.dmg.outputs.dmg_file }}"
           echo "=== Build complete ==="
-          ls -la workbuddy-app/
 
-      # ─────────────────────────────────────────────────────────
-      # 5. Read version info
-      # ─────────────────────────────────────────────────────────
-      - name: Read build metadata
-        id: meta
+      # ── 5. Build DEB ────────────────────────────────────────
+      - name: Package DEB
         run: |
-          BUILD_INFO="workbuddy-app/.workbuddy-linux/build-info.json"
-          if [ -f "$BUILD_INFO" ]; then
-            echo "=== Build Info ==="
-            cat "$BUILD_INFO"
-          fi
-          
-          PATCH_REPORT="workbuddy-app/.workbuddy-linux/patch-report.json"
-          if [ -f "$PATCH_REPORT" ]; then
-            echo "=== Patch Report ==="
-            cat "$PATCH_REPORT"
-          fi
-          
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      # ─────────────────────────────────────────────────────────
-      # 6. Package: DEB
-      # ─────────────────────────────────────────────────────────
-      - name: Build DEB package
-        run: |
-          echo "::group::Building .deb"
           bash scripts/build-deb.sh
-          echo "::endgroup::"
           ls -lh dist/*.deb
 
-      # ─────────────────────────────────────────────────────────
-      # 7. Package: AppImage (mksquashfs, no FUSE needed)
-      # ─────────────────────────────────────────────────────────
-      - name: Build AppImage (mksquashfs)
+      # ── 6. Build AppImage (mksquashfs, no FUSE) ─────────────
+      - name: Package AppImage
         run: |
-          echo "::group::Building AppDir"
-          
-          APP_DIR="workbuddy-app"
-          DIST_DIR="dist"
+          set -euo pipefail
+          VERSION="${{ steps.dmg.outputs.version }}"
+          APPDIR="dist/AppDir"
           APP_ID="workbuddy"
-          PACKAGE_NAME="WorkBuddy"
-          PACKAGE_VERSION="${VERSION}"
-          
-          APPDIR="$DIST_DIR/AppDir"
+
           rm -rf "$APPDIR"
-          mkdir -p \
-            "$APPDIR/opt/$APP_ID" \
-            "$APPDIR/usr/bin" \
-            "$APPDIR/usr/share/applications" \
-            "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-          
-          # Copy app payload
-          cp -a "$APP_DIR/." "$APPDIR/opt/$APP_ID/"
-          
-          # Generate AppRun
-          cat > "$APPDIR/AppRun" <<'APPRUN'
+          mkdir -p "$APPDIR/opt/$APP_ID" \
+                   "$APPDIR/usr/bin" \
+                   "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+          cp -a workbuddy-app/. "$APPDIR/opt/$APP_ID/"
+
+          # AppRun
+          cat > "$APPDIR/AppRun" <<'EOF'
           #!/bin/bash
           set -euo pipefail
           APPDIR="$(dirname "$(readlink -f "$0")")"
-          export APPIMAGE="${APPIMAGE:-}"
-          export APPDIR="${APPDIR:-}"
           export CHROME_DESKTOP="workbuddy.desktop"
           export ELECTRON_FORCE_IS_PACKAGED=1
           export XDG_CURRENT_DESKTOP="Unity:${XDG_CURRENT_DESKTOP:-}"
-          unset ELECTRON_RUN_AS_NODE
-          ARGS=(
-            --disable-dev-shm-usage
-            --in-process-gpu
-            --ozone-platform-hint=auto
-            --enable-wayland-ime
-            --no-sandbox
-            --disable-gpu-sandbox
-          )
-          exec "$APPDIR/opt/workbuddy/electron" "${ARGS[@]}" "$@"
-          APPRUN
+          unset ELECTRON_RUN_AS_NODE 2>/dev/null || true
+          exec "$APPDIR/opt/workbuddy/electron" \
+            --disable-dev-shm-usage --in-process-gpu \
+            --ozone-platform-hint=auto --enable-wayland-ime \
+            --no-sandbox --disable-gpu-sandbox "$@"
+          EOF
           chmod 0755 "$APPDIR/AppRun"
-          
+
           # Desktop entry
-          cat > "$APPDIR/usr/share/applications/$APP_ID.desktop" <<DESKTOP
+          cat > "$APPDIR/$APP_ID.desktop" <<EOF
           [Desktop Entry]
           Name=WorkBuddy
           Comment=AI Agent Desktop Application
@@ -243,100 +121,59 @@ jobs:
           Type=Application
           Categories=Development;IDE;
           StartupNotify=true
-          StartupWMClass=WorkBuddy
-          DESKTOP
-          cp "$APPDIR/usr/share/applications/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
-          
+          EOF
+          cp "$APPDIR/$APP_ID.desktop" "$APPDIR/usr/share/applications/"
+
           # Icon
-          if [ -f "$APP_DIR/.workbuddy-linux/workbuddy.png" ]; then
-            cp "$APP_DIR/.workbuddy-linux/workbuddy.png" \
-              "$APPDIR/usr/share/icons/hicolor/256x256/apps/workbuddy.png"
-            cp "$APP_DIR/.workbuddy-linux/workbuddy.png" "$APPDIR/workbuddy.png"
-            cp "$APP_DIR/.workbuddy-linux/workbuddy.png" "$APPDIR/.DirIcon"
+          if [ -f workbuddy-app/.workbuddy-linux/workbuddy.png ]; then
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/workbuddy.png"
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/.DirIcon"
+            cp workbuddy-app/.workbuddy-linux/workbuddy.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/"
           fi
-          
-          echo "::endgroup::"
-          echo "::group::Building squashfs + AppImage"
-          
-          # Download AppImage runtime
-          RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
-          RUNTIME_CACHE="$DIST_DIR/runtime-x86_64"
-          curl -fsSL -o "$RUNTIME_CACHE" "$RUNTIME_URL"
-          chmod +x "$RUNTIME_CACHE"
-          
-          OUTPUT="$DIST_DIR/${PACKAGE_NAME}-${PACKAGE_VERSION}-x86_64.AppImage"
-          
-          # Build squashfs
-          mksquashfs "$APPDIR" "${OUTPUT}.squashfs" \
-            -noappend -comp gzip -root-owned -no-xattrs
-          
-          # Concatenate runtime + squashfs = AppImage
-          cat "$RUNTIME_CACHE" "${OUTPUT}.squashfs" > "$OUTPUT"
+
+          # Download runtime + build squashfs AppImage
+          curl -fsSL -o dist/runtime-x86_64 \
+            "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+          chmod +x dist/runtime-x86_64
+
+          OUTPUT="dist/WorkBuddy-${VERSION}-x86_64.AppImage"
+          mksquashfs "$APPDIR" "${OUTPUT}.squashfs" -noappend -comp gzip -root-owned -no-xattrs
+          cat dist/runtime-x86_64 "${OUTPUT}.squashfs" > "$OUTPUT"
           chmod +x "$OUTPUT"
           rm -f "${OUTPUT}.squashfs"
-          
-          echo "::endgroup::"
           ls -lh "$OUTPUT"
-          echo "appimage_path=$OUTPUT" >> "$GITHUB_ENV"
 
-      # ─────────────────────────────────────────────────────────
-      # 8. Package: RPM (best-effort)
-      # ─────────────────────────────────────────────────────────
-      - name: Build RPM package
+      # ── 7. Build RPM (best-effort) ──────────────────────────
+      - name: Package RPM
         continue-on-error: true
         run: |
-          echo "::group::Building .rpm"
           if command -v rpmbuild >/dev/null 2>&1; then
-            bash scripts/build-rpm.sh && echo "RPM OK" || echo "RPM FAILED"
+            bash scripts/build-rpm.sh || echo "RPM build failed"
           else
-            echo "rpmbuild not available, skipping RPM"
+            echo "rpmbuild not available, skipping"
           fi
-          echo "::endgroup::"
 
-      # ─────────────────────────────────────────────────────────
-      # 9. Upload artifacts
-      # ─────────────────────────────────────────────────────────
-      - name: Upload build artifacts
+      # ── 8. Upload artifacts ─────────────────────────────────
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: WorkBuddy-Linux-${{ needs.prepare.outputs.version }}
+          name: WorkBuddy-Linux-${{ steps.dmg.outputs.version }}
           path: |
             dist/*.deb
             dist/*.rpm
             dist/*.AppImage
-          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          retention-days: 7
 
-  # ═══════════════════════════════════════════════════════════════
-  # Job 3: Create GitHub Release
-  # ═══════════════════════════════════════════════════════════════
-  release:
-    runs-on: ubuntu-latest
-    needs: [prepare, build]
-    permissions:
-      contents: write
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: WorkBuddy-Linux-${{ needs.prepare.outputs.version }}
-          path: dist/
-
-      - name: List artifacts
-        run: ls -lh dist/
-
-      - name: Create Release
+      # ── 9. Create Release ───────────────────────────────────
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.VERSION }}
-          name: WorkBuddy v${{ env.VERSION }} Linux
+          tag_name: v${{ steps.dmg.outputs.version }}
+          name: WorkBuddy v${{ steps.dmg.outputs.version }} Linux
           body: |
-            ## WorkBuddy v${{ env.VERSION }} — Linux 移植版
+            ## WorkBuddy v${{ steps.dmg.outputs.version }} — Linux 移植版
 
             自动从官方 macOS DMG 构建，适用于 x86_64 Linux。
-
-            ### 📦 安装包
 
             | 文件 | 格式 | 适用系统 |
             |---|---|---|
@@ -344,21 +181,14 @@ jobs:
             | `*.x86_64.rpm` | RPM | Fedora / RHEL / openSUSE |
             | `*-x86_64.AppImage` | AppImage | 通用 Linux（免安装） |
 
-            ### 🚀 快速安装
-
             ```bash
             # Debian/Ubuntu
             sudo dpkg -i workbuddy_*_amd64.deb
-
-            # AppImage（任何发行版）
-            chmod +x WorkBuddy-*.AppImage
-            ./WorkBuddy-*.AppImage
+            # AppImage
+            chmod +x WorkBuddy-*.AppImage && ./WorkBuddy-*.AppImage
             ```
 
-            ### ⚠️ 注意
-
-            - 非官方移植，**请勿向官方反馈 Linux Bug**
-            - 构建自 [workbuddy-linux](https://github.com/${{ github.repository }})
+            > 非官方移植，请勿向官方反馈 Linux Bug。
           files: |
             dist/*.deb
             dist/*.rpm
