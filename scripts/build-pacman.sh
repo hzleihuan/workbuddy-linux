@@ -19,6 +19,7 @@ map_arch() {
     case "$(uname -m)" in
         x86_64) echo "x86_64" ;;
         aarch64) echo "aarch64" ;;
+        loongarch64) echo "loongarch64" ;;
         *) error "Unsupported pacman architecture: $(uname -m)" ;;
     esac
 }

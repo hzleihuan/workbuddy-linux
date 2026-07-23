@@ -31,6 +31,7 @@ Environment:
   WORKBUDDY_INSTALL_DIR     Output app directory (default: ./workbuddy-app)
   ELECTRON_MIRROR           Optional Electron runtime mirror
   ELECTRON_HEADERS_URL      Electron headers dist URL for native rebuilds
+  ELECTRON_LOCAL_ZIP        Path to local Electron zip (for unsupported arch, e.g. loong64)
   WORKBUDDY_DISABLE_SANDBOX Set to 1 to append --no-sandbox flags explicitly
   WORKBUDDY_LOCAL_MODE      Set to 1 to start the local CLI Web UI instead of Desktop
   WORKBUDDY_LOCAL_PORT      Local CLI Web UI port (default: 7890)
@@ -392,6 +393,7 @@ main() {
 
     info "Using app bundle: $app_bundle"
     info "Using Electron: $ELECTRON_VERSION"
+    info "Using architecture: $ARCH"
     info "Upstream version: $upstream_version (full: $full_version)"
 
     # Export for downstream packaging scripts

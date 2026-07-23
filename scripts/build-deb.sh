@@ -16,7 +16,7 @@ CONTROL_TEMPLATE="$REPO_DIR/packaging/linux/control"
 
 map_arch() {
     case "$(dpkg --print-architecture)" in
-        amd64|arm64|armhf) dpkg --print-architecture ;;
+        amd64|arm64|armhf|loong64|loongarch64) dpkg --print-architecture ;;
         *) error "Unsupported Debian architecture: $(dpkg --print-architecture)" ;;
     esac
 }

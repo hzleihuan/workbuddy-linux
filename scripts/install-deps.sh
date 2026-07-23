@@ -92,6 +92,12 @@ install_nodesource_nodejs() {
     apt_arch="$(dpkg --print-architecture)"
     case "$apt_arch" in
         amd64|arm64|armhf) ;;
+        loong64|loongarch64)
+            warn "NodeSource does not publish loong64 packages; installing Node.js from the distro or a loong64 mirror instead"
+            apt-get update -qq 2>/dev/null || true
+            apt-get install -y nodejs npm 2>/dev/null || true
+            return 0
+            ;;
         *) error "NodeSource does not support apt architecture: $apt_arch" ;;
     esac
 

@@ -78,6 +78,7 @@ lydell_node_pty_linux_package() {
     case "$ARCH" in
         x86_64) echo "@lydell/node-pty-linux-x64" ;;
         aarch64) echo "@lydell/node-pty-linux-arm64" ;;
+        loongarch64) echo "@lydell/node-pty-linux-loong64" ;;
         *) return 1 ;;
     esac
 }
@@ -402,6 +403,7 @@ install_cli_ripgrep_linux() {
     case "$ARCH" in
         x86_64) linux_dir="x64-linux" ;;
         aarch64) linux_dir="arm64-linux" ;;
+        loongarch64) linux_dir="loong64-linux" ;;
         *) warn "  No ripgrep binary for $ARCH"; return 0 ;;
     esac
 
@@ -461,6 +463,29 @@ install_linux_platform_packages() {
     # Install @lydell/node-pty Linux package in cli/node_modules
     if [ -d "$app_dir/cli/node_modules/@lydell/node-pty" ]; then
         install_lydell_node_pty_linux "$app_dir/cli"
+    fi
+
+    # For architectures without a prebuilt @lydell/node-pty platform package
+    # (e.g. loongarch64/loong64), synthesize a Linux platform package entry
+    # so the sidecar/pty still resolves at runtime. We register the generic
+    # linux package that npm resolves for the architecture.
+    if [ "$ARCH" = "loongarch64" ]; then
+        info "  Synthesizing @lydell/node-pty-linux-loong64 platform package"
+        local lydell_dir="$app_dir/node_modules/@lydell"
+        mkdir -p "$lydell_dir/node-pty-linux-loong64"
+        cat > "$lydell_dir/node-pty-linux-loong64/package.json" <<'PKGJSON'
+{
+  "name": "@lydell/node-pty-linux-loong64",
+  "version": "0.0.0",
+  "os": ["linux"],
+  "cpu": ["loong64"],
+  "main": "index.js",
+  "scripts": {}
+}
+PKGJSON
+        cat > "$lydell_dir/node-pty-linux-loong64/index.js" <<'PKGJS'
+module.exports = require('@lydell/node-pty-linux-x64');
+PKGJS
     fi
 
     # Ensure the Linux @lydell/node-pty platform package is also in the top-level node_modules

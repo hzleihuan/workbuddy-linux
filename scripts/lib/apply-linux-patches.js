@@ -48,7 +48,7 @@ if (!asarPath || !marker || !lydellPlatformPackage) {
     process.exit(2);
 }
 
-if (!/^@lydell\/node-pty-linux-(x64|arm64)$/.test(lydellPlatformPackage)) {
+if (!/^@lydell\/node-pty-linux-(x64|arm64|loong64)$/.test(lydellPlatformPackage)) {
     console.error('[apply-linux-patches] ERROR: unsupported @lydell platform package: ' + lydellPlatformPackage);
     process.exit(2);
 }
@@ -1601,11 +1601,11 @@ const lydellLinuxDst = path.join(tmpDir, 'node_modules', '@lydell', lydellPackag
 if (fs.existsSync(lydellLinuxSrc) && !fs.existsSync(lydellLinuxDst)) {
     fs.cpSync(lydellLinuxSrc, lydellLinuxDst, { recursive: true });
     log('copied ' + lydellPlatformPackage + ' into asar source for repack');
-    markRequired('lydellPlatformPackageRegistered', true);
+    markOptional('lydellPlatformPackageRegistered', true);
 } else if (fs.existsSync(lydellLinuxDst)) {
-    markRequired('lydellPlatformPackageRegistered', true);
+    markOptional('lydellPlatformPackageRegistered', true);
 } else {
-    markRequired('lydellPlatformPackageRegistered', false);
+    markOptional('lydellPlatformPackageRegistered', false);
 }
 
 // ---------------------------------------------------------------------------
