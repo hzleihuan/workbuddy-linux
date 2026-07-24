@@ -735,6 +735,18 @@ if (source.includes(marker)) {
     // the downloaded payloads (.dmg / .exe) cannot be applied here. We
     // surface a greyed-out menu entry so users see that auto-update is
     // intentionally unavailable on the Linux port.
+    //
+    // NOTE (5.3.3+): the menu-item builder `getUpdateMenuItem(texts,
+    // updateState)` was moved out of the main-process bundle into the
+    // renderer bundle, so it is no longer reachable from this
+    // main/index.js patch. We therefore no longer treat the grey-out as
+    // a hard requirement: the actual disable is enforced by the
+    // `updateRpcDisabled` (stubbed updateCheck/updateDownload/... RPCs)
+    // and `updateServiceDisabled` (early-return in
+    // UpdateServiceLinux.checkForUpdates) patches below, both of which
+    // still anchor on main/index.js. Clicking "Check for Updates" on
+    // Linux is thus a harmless no-op. This patch stays best-effort: when
+    // the anchor is present (older builds) we still grey it out.
     // -----------------------------------------------------------------------
     const updateMenuMarker = 'function getUpdateMenuItem(texts, updateState) {';
     const updateMenuIdx = source.indexOf(updateMenuMarker);
@@ -752,9 +764,10 @@ if (source.includes(marker)) {
         source = source.slice(0, updateMenuIdx)
             + linuxUpdateShim
             + source.slice(updateMenuIdx + updateMenuMarker.length);
-        markRequired('updateMenuDisabled', true);
+        markOptional('updateMenuDisabled', true);
     } else {
-        markRequired('updateMenuDisabled', false);
+        console.error('[apply-linux-patches] ERROR: updateMenuDisabled anchor not found; skipping (menu-item builder moved to renderer bundle in 5.3.3; update RPCs/services still stubbed)');
+        markOptional('updateMenuDisabled', false);
     }
 
     // Neutralize updateCheck / updateDownload / updateQuitAndInstall RPCs
