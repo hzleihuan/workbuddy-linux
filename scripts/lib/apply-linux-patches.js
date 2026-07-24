@@ -1462,6 +1462,78 @@ if (!patchReport.required.networkDiagnosticsTimeouts && !patchReport.optional?.n
     }
 }
 
+// ---------------------------------------------------------------------------
+// Linux quit fix (patch group "linuxQuit")
+//
+// On Linux the app can never exit:
+//  - The "退出 WorkBuddy" menu calls app.quit(), but the before-quit handler
+//    (main/index.js) enters an async confirmation branch — active-task quit
+//    confirmation (promptActiveTasksQuitConfirmation) or Tencent-docs-preview
+//    quit confirmation (promptDocumentPreviewQuitConfirmation) — that awaits a
+//    promise (daemonSessionQueries.getActiveSessions() /
+//    releaseTencentDocsPreviewContextsWithPrompt) which never resolves on
+//    Linux. event.preventDefault() was already called, so app.quit() is never
+//    re-triggered and the process hangs forever.
+//  - The X button hits the window close handler's `isMac || this.trayActive`
+//    branch, which preventDefaults and hides the window to the tray instead of
+//    closing it (and window-all-closed then returns early because the tray is
+//    active), so the process also never quits from X.
+//
+// On Linux we skip both async confirmation branches (they are non-essential on
+// a port where the daemon / Tencent-docs-preview features do not function) and
+// let the close / window-all-closed handlers actually quit the app. The
+// injected `process.platform !== "linux"` guards keep Windows/macOS behavior
+// unchanged.
+// ---------------------------------------------------------------------------
+{
+    const from = 'if (!isQuittingForUpdate && !userConfirmedActiveTasksQuit && mainBootstrap !== null && windowManager !== null) {';
+    const to = 'if (!isQuittingForUpdate && !userConfirmedActiveTasksQuit && mainBootstrap !== null && windowManager !== null && process.platform !== "linux") {';
+    if (source.includes(from)) {
+        source = source.replace(from, to);
+        fs.writeFileSync(indexPath, source);
+        log('patched main/index.js (linux quit: skip active-tasks quit confirmation on linux)');
+        markOptional('linuxQuitActiveTasksConfirm', true);
+    } else {
+        markOptional('linuxQuitActiveTasksConfirm', false);
+    }
+}
+{
+    const from = 'if (!isQuittingForUpdate && !userConfirmedDocumentPreviewQuit) {';
+    const to = 'if (!isQuittingForUpdate && !userConfirmedDocumentPreviewQuit && process.platform !== "linux") {';
+    if (source.includes(from)) {
+        source = source.replace(from, to);
+        fs.writeFileSync(indexPath, source);
+        log('patched main/index.js (linux quit: skip document-preview quit confirmation on linux)');
+        markOptional('linuxQuitDocPreviewConfirm', true);
+    } else {
+        markOptional('linuxQuitDocPreviewConfirm', false);
+    }
+}
+{
+    const from = '\t\t\tif (isMac || this.trayActive) {';
+    const to = '\t\t\tif (isMac) {';
+    if (source.includes(from)) {
+        source = source.replace(from, to);
+        fs.writeFileSync(indexPath, source);
+        log('patched main/index.js (linux quit: X closes window instead of hiding to tray)');
+        markOptional('linuxQuitCloseToTray', true);
+    } else {
+        markOptional('linuxQuitCloseToTray', false);
+    }
+}
+{
+    const from = '\tif (windowManager?.isTrayActive) {';
+    const to = '\tif (windowManager?.isTrayActive && process.platform !== "linux") {';
+    if (source.includes(from)) {
+        source = source.replace(from, to);
+        fs.writeFileSync(indexPath, source);
+        log('patched main/index.js (linux quit: window-all-closed quits even with tray on linux)');
+        markOptional('linuxQuitWindowAllClosed', true);
+    } else {
+        markOptional('linuxQuitWindowAllClosed', false);
+    }
+}
+
 assertRequiredPatches();
 
 // ---------------------------------------------------------------------------
