@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "@genie/workbuddy-desktop",
-  "version": "5.2.6",
+  "version": "5.3.3",
   "description": "WorkBuddy Desktop - AI Agent Desktop Application",
   "author": "Tencent Technology (Shenzhen)",
   "main": "main/index.js",
@@ -19,7 +19,7 @@
     "dingtalk-stream": "^2.1.5",
     "axios": "^1.13.6",
     "better-sqlite3": "^12.8.0",
-    "@lydell/node-pty": "^1.2.0-beta.12",
+    "@lydell/node-pty": "^1.2.0-beta.14",
     "@openai/agents": "^0.5.2",
     "adm-zip": "^0.5.16",
     "chokidar": "^3.6.0",
@@ -30,12 +30,12 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
-    "@lydell/node-pty-darwin-arm64": "1.2.0-beta.12",
-    "@lydell/node-pty-darwin-x64": "1.2.0-beta.12",
-    "@lydell/node-pty-linux-arm64": "1.2.0-beta.12",
-    "@lydell/node-pty-linux-x64": "1.2.0-beta.12",
-    "@lydell/node-pty-win32-arm64": "1.2.0-beta.12",
-    "@lydell/node-pty-win32-x64": "1.2.0-beta.12",
+    "@lydell/node-pty-darwin-arm64": "1.2.0-beta.14",
+    "@lydell/node-pty-darwin-x64": "1.2.0-beta.14",
+    "@lydell/node-pty-linux-arm64": "1.2.0-beta.14",
+    "@lydell/node-pty-linux-x64": "1.2.0-beta.14",
+    "@lydell/node-pty-win32-arm64": "1.2.0-beta.14",
+    "@lydell/node-pty-win32-x64": "1.2.0-beta.14",
     "node-pty": "1.1.0"
   },
   "directories": {

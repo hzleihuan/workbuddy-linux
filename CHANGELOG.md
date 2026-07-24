@@ -10,6 +10,15 @@
 
 ---
 
+## [5.3.3+wb1] — 2026-07-24
+
+目标上游版本：WorkBuddy `5.3.3.33961208`（macOS x64 DMG，构建号 `5801cce5`），Electron 37.10.3。
+
+从 5.2.6 到 5.3.3 的适配。补丁锚点状态待首次构建验证，
+构建后请检查 `workbuddy-app/.workbuddy-linux/patch-report.json`。
+
+---
+
 ## [5.2.6+wb1] — 2026-07-17
 
 目标上游版本：WorkBuddy `5.2.6.33159827`（macOS x64 DMG，构建号 `8ee6bc11`）。

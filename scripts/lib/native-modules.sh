@@ -481,7 +481,7 @@ install_linux_platform_packages() {
             if [ -f "$pty_node" ]; then
                 mkdir -p "$pty_loong_pkg/build/Release"
                 cp "$pty_node" "$pty_loong_pkg/build/Release/pty.node"
-                local pty_version="1.2.0-beta.12"
+                local pty_version="1.2.0-beta.14"
                 cat > "$pty_loong_pkg/package.json" << PKGJSON
 {
   "name": "@lydell/node-pty-linux-loong64",
@@ -528,7 +528,7 @@ INDEXJS
             info "  Copied $pkg_name from cli/ to top-level node_modules"
         else
             # Install fresh from npm
-            local version="1.2.0-beta.12"
+            local version="1.2.0-beta.14"
             local build_dir="$WORK_DIR/lydell-pty-toplevel"
             rm -rf "$build_dir"
             mkdir -p "$build_dir"
