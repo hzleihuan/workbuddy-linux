@@ -13,7 +13,15 @@
 
 ## 一、结论先行
 
-整个转换是一条命令：
+**最省事：用仓库的一键入口**（自动完成下载/解压/转换/打包，本文其余部分是它的展开说明）：
+
+```bash
+make port ARGS="--runtime-from /opt/WorkBuddy --format deb"
+# 或等价的直接调用
+bash scripts/pipeline.sh --arch loong64 --runtime-from /opt/WorkBuddy --format deb
+```
+
+**只想单独跑转换这一步**，则是一条命令：
 
 ```bash
 node scripts/lib/apply-linux-patches.js \

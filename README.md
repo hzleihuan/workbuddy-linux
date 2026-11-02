@@ -52,6 +52,53 @@ make install
 
 ## 构建与运行
 
+### 一条命令完成（推荐）
+
+下载、解压、打补丁/转换、打包四个阶段已串成一个入口：
+
+```bash
+make all                                        # 自动下载（或复用 downloads/ 里的 DMG）→ 构建 → 打包
+make all ARGS="--dmg /path/to/WorkBuddy.dmg --format deb"
+make all ARGS="--install"                       # 打包后直接安装（需要 sudo）
+make port ARGS="--runtime-from /opt/WorkBuddy"  # 显式按 loong64 构建
+```
+
+等价的直接调用：
+
+```bash
+bash scripts/pipeline.sh --dmg /path/to/WorkBuddy.dmg --runtime-from /opt/WorkBuddy --format deb
+```
+
+分阶段日志为 `[1/5] 获取输入 → [2/5] 读取元数据 → [3/5] 构建 → [4/5] 打包 → [5/5] 安装`，
+结束时打印上游版本、补丁报告摘要（`patch-report.json` 的 verdict）与产物路径。
+若需分步执行或想保留中间产物，仍可使用下方各小节的手动方式。
+
+**loong64 说明**：上游未发布 loong64 版 Electron 与原生模块，`install.sh` 的
+"下载 Electron + 重建原生模块"路线需要完整 node-gyp 工具链且耗时很长，因此 loong64 走
+`apply-linux-patches.js --layout` 的拼装路线（macOS 应用资源 + 已有的 loong64 运行时/原生模块）。
+运行时来源按以下顺序自动探测：
+
+1. `--runtime-from <dir>` / `--runtime-deb <deb>`（显式指定，最优先）；
+2. `/opt/WorkBuddy`、`/opt/workbuddy`、`/opt/apps/cn.workbuddy.otohime/files`；
+3. `downloads/` 下任一 `*loong64*.deb` / `*loongarch64*.deb`（自动 `dpkg-deb -x` 解包取用）。
+
+三者都没有时会直接报错并列出获取方式。完整原理与排错见
+[`docs/build-from-dmg-loong64.md`](docs/build-from-dmg-loong64.md)。
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--dmg <path>` / `--app <path>` | 指定 DMG 或已解压的 `.app` |
+| `--arch <loong64\|x64\|arm64>` | 目标架构（默认取 `uname -m`） |
+| `--runtime-from <dir>` / `--runtime-deb <deb>` | loong64 参考运行时来源 |
+| `--electron-zip <zip>` | 透传给 `install.sh` 的 `ELECTRON_LOCAL_ZIP` |
+| `--format <deb\|rpm\|pacman\|appimage\|none>` | 打包格式，`none` 表示只构建不打包 |
+| `--package-only` | 跳过构建，直接用现有 `workbuddy-app` 打包 |
+| `--install` | 打包后调用 `scripts/install-package.sh` |
+| `--strict-patch` | 补丁锚点缺失也当失败（CI 用） |
+| `--keep-work` | 保留临时目录，便于排错 |
+
 ### 推荐构建方式
 
 将官方 DMG 文件放入 `downloads/` 目录后，直接执行：
@@ -274,6 +321,32 @@ make install
 > Testing scope: fully tested on Debian-based (Linux Mint 22.3) and Arch-based (CachyOS) systems.
 
 ## Build & Run
+
+### One-shot Pipeline (Recommended)
+
+Download → extract → patch/convert → package is wired into a single entry point:
+
+```bash
+make all                                        # download (or reuse downloads/) → build → package
+make all ARGS="--dmg /path/to/WorkBuddy.dmg --format deb"
+make all ARGS="--install"                       # package and install (needs sudo)
+make port ARGS="--runtime-from /opt/WorkBuddy"  # force a loong64 build
+```
+
+Direct invocation works the same way:
+
+```bash
+bash scripts/pipeline.sh --dmg /path/to/WorkBuddy.dmg --runtime-from /opt/WorkBuddy --format deb
+```
+
+Five stages are logged (`input → metadata → build → package → install`), and the run ends with the
+upstream version, a `patch-report.json` verdict summary and the artifact path.
+
+**loong64 note**: upstream ships neither a loong64 Electron runtime nor loong64 native modules, and the
+"download Electron + rebuild native modules" path needs a full node-gyp toolchain. loong64 therefore uses
+`apply-linux-patches.js --layout` (macOS app resources + an existing loong64 runtime). The runtime is
+resolved from `--runtime-from` / `--runtime-deb`, then `/opt/WorkBuddy`, then any `*loong64*.deb` under
+`downloads/`. See [`docs/build-from-dmg-loong64.md`](docs/build-from-dmg-loong64.md).
 
 ### Recommended Build Method
 

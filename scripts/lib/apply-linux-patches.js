@@ -60,7 +60,7 @@
  *
  * ---------------------------------------------------------------------------
  * Usage:
- *   node apply-linux-patches.js <path/to/app.asar> <marker> [@lydell/node-pty-linux-arch]
+ *   node apply-linux-patches.js <path/to/app.asar> <marker> <@lydell/node-pty-linux-arch>
  *
  * 参数（均可省略，也可以用环境变量）：
  *   --arch=loong64|x64|arm64       覆盖架构（默认从 platform pkg 推断）
@@ -75,7 +75,13 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const asar = require('@electron/asar');
+let asar;
+try {
+    asar = require('@electron/asar');
+} catch (err) {
+    console.error('[apply-linux-patches] ERROR: 缺少 @electron/asar。请把 NODE_PATH 指向已安装该模块的目录（如 .asar-tool/node_modules），或先执行 npm i @electron/asar@3.4.1');
+    process.exit(2);
+}
 
 // ---------------------------------------------------------------------------
 // 参数解析：兼容 install.sh 的三段位置参数，同时支持 --flag。
@@ -117,7 +123,7 @@ if (!FLAGS.nativeFrom) FLAGS.nativeFrom = FLAGS.runtimeFrom;
 
 let [, , asarPath, marker, lydellPlatformPackage] = [null, null, ...positional];
 if (!asarPath || !marker) {
-    console.error('Usage: apply-linux-patches.js <path/to/app.asar> <marker> [@lydell/node-pty-linux-arch]');
+    console.error('Usage: apply-linux-patches.js <path/to/app.asar> <marker> <@lydell/node-pty-linux-arch>');
     console.error('       apply-linux-patches.js --layout=<outDir> --app=<X.app> --runtime-from=<dir> <path/to/app.asar> <marker>');
     process.exit(2);
 }
@@ -142,12 +148,17 @@ function resolveArch(explicit) {
     if (lydellPlatformPackage && LYDELL_RE.test(lydellPlatformPackage)) {
         return LYDELL_RE.exec(lydellPlatformPackage)[1];
     }
-    // loongarch64 / loong64 都映射到上游的 loong64 平台包名
-    const hostArch = ARCH_ALIASES[process.arch] || process.arch;
-    return hostArch;
+    // 目标架构必须显式给出：按构建机架构静默推断会在交叉构建时产出架构错位的 asar。
+    throw new Error('必须指定 @lydell/node-pty-linux-<arch> 或 --arch，不做本机架构推断');
 }
 
-const TARGET_ARCH = resolveArch(FLAGS.arch);
+let TARGET_ARCH;
+try {
+    TARGET_ARCH = resolveArch(FLAGS.arch);
+} catch (err) {
+    console.error('[apply-linux-patches] ERROR: ' + err.message);
+    process.exit(2);
+}
 if (!lydellPlatformPackage) lydellPlatformPackage = '@lydell/node-pty-linux-' + TARGET_ARCH;
 if (!LYDELL_RE.test(lydellPlatformPackage)) {
     console.error('[apply-linux-patches] ERROR: unsupported @lydell platform package: ' + lydellPlatformPackage);
