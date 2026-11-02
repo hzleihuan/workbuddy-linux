@@ -34,50 +34,201 @@
  * temp directory, edits main/index.js + main/sidecar-entry.js, and
  * repacks the asar while preserving the original unpacked=true set.
  *
+ * ---------------------------------------------------------------------------
+ * 5.9.x note — 为什么大部分补丁从 "注入" 变成 "探测"
+ * ---------------------------------------------------------------------------
+ * 5.9.3 把单文件 main/index.js 拆成了 300+ 个 main/*.js 模块并做了重命名，
+ * 同时把当年这些补丁要解决的问题在**上游**修掉了：
+ *
+ *   ACC_PRODUCT_CONFIG_* 溢出 → 上游自带 spill（ACC_PRODUCT_CONFIG_PATH +
+ *       workbuddy-product-spill-*.json），E2BIG shim 已无必要；
+ *   托盘菜单/图标 → TrayController 已内置 linux 分支
+ *       (this.tray.setContextMenu(this.buildFallbackMenu()) + tray-linux.png)；
+ *   自动更新 → 已拆出 main/update-service.linux.js(AppImage) 并按
+ *       linuxSelfUpdateSupported 门控；
+ *   isCliInstalled 卡死 → 上游已加 exec timeout:5e3。
+ *
+ * 于是本脚本对每个补丁给出四种结果，而不是简单的 true/false：
+ *
+ *   applied          已注入（或已存在 marker）
+ *   upstream-native  上游已原生实现，本脚本主动跳过（不是失败）
+ *   anchor-gone      锚点不存在：上游改写/删除，或版本过新（仅告警）
+ *   failed           必选补丁失败 → 退出码 7
+ *
+ * 能力探测（capabilities）在一次运行里只做一遍，结果写进 patch-report.json，
+ * 便于每次上游升级后快速看出"哪些补丁已经可以退役"。
+ *
+ * ---------------------------------------------------------------------------
  * Usage:
- *   node apply-linux-patches.js <path/to/app.asar> <marker>
+ *   node apply-linux-patches.js <path/to/app.asar> <marker> [@lydell/node-pty-linux-arch]
+ *
+ * 参数（均可省略，也可以用环境变量）：
+ *   --arch=loong64|x64|arm64       覆盖架构（默认从 platform pkg 推断）
+ *   --strict                       有 anchor-gone 的必选补丁时同样失败
+ *   --force-env-shim               即使上游已自带 config spill 也注入 E2BIG shim
+ *   --layout=<outDir>              dmg 转换模式：先组装 loong64 运行树，再打补丁
+ *   --app=<X.app>                  转换模式的输入 .app（默认从 asar 路径反推）
+ *   --runtime-from=<dir>           loong64 Electron 运行时来源目录（默认 /opt/WorkBuddy）
+ *   --native-from=<dir>            loong64 原生模块来源目录（默认同 runtime-from）
+ *   --dry-run                      只做分析并打印报告，不写任何文件
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const asar = require('@electron/asar');
 
-const [, , asarPath, marker, lydellPlatformPackage] = process.argv;
-if (!asarPath || !marker || !lydellPlatformPackage) {
-    console.error('Usage: apply-linux-patches.js <path/to/app.asar> <marker> <@lydell/node-pty-linux-arch>');
+// ---------------------------------------------------------------------------
+// 参数解析：兼容 install.sh 的三段位置参数，同时支持 --flag。
+// ---------------------------------------------------------------------------
+const argv = process.argv.slice(2);
+const FLAGS = {
+    strict: false,
+    forceEnvShim: false,
+    dryRun: false,
+    layoutOut: process.env.WB_LAYOUT_OUT || '',
+    layoutApp: process.env.WB_LAYOUT_APP || '',
+    runtimeFrom: process.env.WB_RUNTIME_FROM || '/opt/WorkBuddy',
+    nativeFrom: process.env.WB_NATIVE_FROM || '',
+    arch: '',
+};
+const positional = [];
+for (const a of argv) {
+    const m = /^--([a-zA-Z-]+)(?:=(.*))?$/.exec(a);
+    if (!m) { positional.push(a); continue; }
+    const key = m[1];
+    const val = m[2];
+    switch (key) {
+        case 'strict': FLAGS.strict = true; break;
+        case 'force-env-shim': FLAGS.forceEnvShim = true; break;
+        case 'dry-run': FLAGS.dryRun = true; break;
+        case 'layout': FLAGS.layoutOut = val || ''; break;
+        case 'app': FLAGS.layoutApp = val || ''; break;
+        case 'runtime-from': FLAGS.runtimeFrom = val || ''; break;
+        case 'native-from': FLAGS.nativeFrom = val || ''; break;
+        case 'arch': FLAGS.arch = val || ''; break;
+        default:
+            console.error('[apply-linux-patches] ERROR: unknown flag --' + key);
+            process.exit(2);
+    }
+}
+if (process.env.WB_STRICT === '1') FLAGS.strict = true;
+if (process.env.WB_FORCE_ENV_SHIM === '1') FLAGS.forceEnvShim = true;
+if (!FLAGS.nativeFrom) FLAGS.nativeFrom = FLAGS.runtimeFrom;
+
+let [, , asarPath, marker, lydellPlatformPackage] = [null, null, ...positional];
+if (!asarPath || !marker) {
+    console.error('Usage: apply-linux-patches.js <path/to/app.asar> <marker> [@lydell/node-pty-linux-arch]');
+    console.error('       apply-linux-patches.js --layout=<outDir> --app=<X.app> --runtime-from=<dir> <path/to/app.asar> <marker>');
     process.exit(2);
 }
 
-if (!/^@lydell\/node-pty-linux-(x64|arm64|loong64)$/.test(lydellPlatformPackage)) {
+const LYDELL_RE = /^@lydell\/node-pty-linux-(x64|arm64|loong64)$/;
+const ARCH_ALIASES = {
+    loong64: 'loong64',
+    loongarch64: 'loong64',
+    'loongarch64-linux': 'loong64',
+    x64: 'x64',
+    amd64: 'x64',
+    arm64: 'arm64',
+    aarch64: 'arm64',
+};
+
+function resolveArch(explicit) {
+    if (explicit) {
+        const a = ARCH_ALIASES[String(explicit).toLowerCase()];
+        if (!a) throw new Error('unsupported --arch: ' + explicit);
+        return a;
+    }
+    if (lydellPlatformPackage && LYDELL_RE.test(lydellPlatformPackage)) {
+        return LYDELL_RE.exec(lydellPlatformPackage)[1];
+    }
+    // loongarch64 / loong64 都映射到上游的 loong64 平台包名
+    const hostArch = ARCH_ALIASES[process.arch] || process.arch;
+    return hostArch;
+}
+
+const TARGET_ARCH = resolveArch(FLAGS.arch);
+if (!lydellPlatformPackage) lydellPlatformPackage = '@lydell/node-pty-linux-' + TARGET_ARCH;
+if (!LYDELL_RE.test(lydellPlatformPackage)) {
     console.error('[apply-linux-patches] ERROR: unsupported @lydell platform package: ' + lydellPlatformPackage);
     process.exit(2);
 }
 
 function log(msg) { console.log('  [apply-linux-patches] ' + msg); }
+function warn(msg) { console.warn('  [apply-linux-patches] NOTE: ' + msg); }
+
+// ---------------------------------------------------------------------------
+// 补丁状态词表 + 报告结构。
+// required/optional 两棵旧结构保留，供 install.sh / 历史脚本读取；
+// 新结构 patches[name] = { status, detail } 给人看。
+// ---------------------------------------------------------------------------
+const STATUS = {
+    APPLIED: 'applied',
+    UPSTREAM: 'upstream-native',
+    GONE: 'anchor-gone',
+    FAILED: 'failed',
+};
 
 const patchReport = {
     marker,
     lydellPlatformPackage,
+    arch: TARGET_ARCH,
     required: {},
     optional: {},
+    patches: {},
+    capabilities: {},
+    counts: {},
+    verdict: 'pending',
 };
 
+function setPatch(name, status, detail, required) {
+    patchReport.patches[name] = { status, detail: detail || '', required: Boolean(required) };
+    if (required) patchReport.required[name] = status === STATUS.APPLIED || status === STATUS.UPSTREAM;
+    else patchReport.optional[name] = status === STATUS.APPLIED;
+    const label = status === STATUS.APPLIED ? 'ok' :
+        status === STATUS.UPSTREAM ? 'upstream' :
+            status === STATUS.GONE ? 'gone' : 'FAIL';
+    log('[' + label + '] ' + name + (detail ? ' — ' + detail : ''));
+}
+
+// 旧调用点保持不变：markRequired(name, ok) / markOptional(name, ok)
 function markRequired(name, ok) {
-    patchReport.required[name] = Boolean(ok);
+    setPatch(name, ok ? STATUS.APPLIED : STATUS.FAILED, '', true);
 }
 
 function markOptional(name, ok) {
-    patchReport.optional[name] = Boolean(ok);
+    setPatch(name, ok ? STATUS.APPLIED : STATUS.GONE, '', false);
+}
+
+function markUpstream(name, detail, required) {
+    setPatch(name, STATUS.UPSTREAM, detail, required);
+}
+
+function markAnchorGone(name, detail) {
+    setPatch(name, STATUS.GONE, detail, false);
 }
 
 function assertRequiredPatches() {
     const failed = Object.entries(patchReport.required)
         .filter(([, ok]) => !ok)
         .map(([name]) => name);
+    if (FLAGS.strict) {
+        for (const [name, p] of Object.entries(patchReport.patches)) {
+            if (p.required && p.status === STATUS.GONE && !failed.includes(name)) failed.push(name);
+        }
+    }
     if (failed.length > 0) {
-        console.error('[apply-linux-patches] ERROR: required patches failed: ' + failed.join(', '));
+        console.error('[apply-linux-patches] ERROR: required patches not applied: ' + failed.join(', '));
         process.exit(7);
     }
+}
+
+function summarizeReport() {
+    const counts = { applied: 0, 'upstream-native': 0, 'anchor-gone': 0, failed: 0 };
+    for (const p of Object.values(patchReport.patches)) counts[p.status] = (counts[p.status] || 0) + 1;
+    patchReport.counts = counts;
+    patchReport.verdict = counts.failed > 0 ? 'fail' : 'ok';
+    log('patch summary: ' + Object.entries(counts).map(([k, v]) => k + '=' + v).join(', '));
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +238,296 @@ function assertRequiredPatches() {
 //      (b) we can reliably recover the exact bytes for every entry.
 //    Unpacked entries are copied from the sibling <asar>.unpacked/ dir.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 0. 转换阶段（可选）：把 macOS .app 的 Resources 树 + 本机 loong64 运行时 /
+//    原生模块，组装成可直接运行的 Linux 目录树。
+//
+//    这一步回答的是"从 dmh 到本机能跑"里 asar 之外的部分。当年这些动作散在
+//    install.sh / native-modules.sh / 手工脚本里，判据只能靠 diff 两份安装来
+//    反推；这里把它们固化成三条规则：
+//
+//      A. Resources 树整体搬过来（macOS 与 Linux 的 JS 载荷是同一份）。
+//      B. 剔除 mac 专属二进制（.dylib / .icns / *.lproj / *darwin* / 已知
+//         mac 工具），保留所有跨平台 JS 与资源。
+//      C. 覆盖 loong64 原生层：Electron 运行时、node-pty、koffi、im-napi、
+//         im-channels-native、ripgrep/genie-trash vendor、tray 图标、
+//         wb-storage-shim 等。缺一个就起不来或崩溃，所以逐项校验 ELF 架构。
+//
+//    来源目录（--runtime-from / --native-from）默认指向本机已知可用的安装
+//    （/opt/WorkBuddy）。loong64 原生件无法从 dmg 里"变"出来，必须由既有
+//    安装或 deb 提供——脚本负责搬运与校验，不负责编译。
+// ---------------------------------------------------------------------------
+const MAC_ONLY_EXT = /\.(dylib|icns|dSYM)$/i;
+// darwin/arm64-mac 目录与文件名（node-pty-darwin-x64、os-bridge.darwin-arm64.node …）
+const MAC_ONLY_PATH_PART = /(^|[-_/.])darwin([-_](x64|arm64))?([-_/.]|$)|(^|[-_/])(x64|arm64)-darwin([-_/.]|$)|(^|[-_/])(toybox-macos|zsh-macos)([-_/.]|$)/i;
+// 明确只属于 mac 交付物的可执行文件。按**路径后缀**匹配，兼容
+// resources/ 与 resources/app.asar.unpacked/ 两种落点。
+const MAC_ONLY_PATHS = [
+    'cli/bin/native',
+    'cli/vendor/shim/native',
+    'cli/vendor/wecom-cli/wecom-cli',
+    'cli/vendor/sandbox/5.9.5/betterleaks',
+    'cli/vendor/sandbox/5.9.5/sandbox-center',
+    'cli/vendor/sandbox/5.9.5/sandbox-cli',
+    'cli/vendor/sandbox/5.9.5/sandbox-cli-gc',
+    'native/computer-use-launcher',
+    'native/turing-sdk',
+    'node_modules/electron-macos-notification',
+    'node_modules/fn-key-monitor',
+    'node_modules/@genie/agent-harness/bin/native',
+    'node_modules/@genie/agent-harness/cli/bin/native',
+    'node_modules/@genie/agent-harness/cli/vendor/shim/native',
+    'node_modules/@genie/agent-harness/cli/vendor/ripgrep',
+    'resources/plugins/workbuddy-builtin/builtin-plugins/weixinpay/prebuilds',
+    'resources/plugins/workbuddy-builtin/mcps/agently-cli/bin/agently-cli',
+    'resources/extensions/workbuddy-baas-v2/node_modules/esbuild/bin/esbuild',
+    'resources/wecom-agent-confirm/WeComAgentConfirmSDK.dll',
+    // macOS 专用的两个辅助载荷（本机既有构建同样不带）
+    'TuringShield.bundle',
+    'workbuddy-wechat-notifier',
+];
+// 目标架构对应的 @lydell/node-pty 平台包；其它架构整包剔除（本机既有构建同样如此）
+const KEEP_LYDELL_RE = new RegExp('(^|/)node_modules/@lydell/node-pty-linux-' + TARGET_ARCH + '(/|$)');
+function isMacOnlyPath(rel) {
+    if (MAC_ONLY_EXT.test(rel) || MAC_ONLY_PATH_PART.test(rel)) return 'mac-extension/arch';
+    if (/(^|\/)[^/]+\.lproj(\/|$)/.test(rel)) return 'mac-lproj';
+    for (const p of MAC_ONLY_PATHS) {
+        if (rel === p || rel.endsWith('/' + p)) return 'mac-tool';
+    }
+    if (/(^|\/)node_modules\/@lydell\/node-pty-/.test(rel) && !KEEP_LYDELL_RE.test(rel)) return 'other-arch-pty';
+    // 只发布 x64/arm64/win32 预编译的包，loong64 上根本加载不了；
+    // 本机既有构建同样整包剔除，剔除后功能由 JS 回退路径覆盖。
+    if (/(^|\/)node_modules\/@ban-dal(\/|$)/.test(rel)) return 'no-loong64-build';
+    return '';
+}
+
+// loong64 原生层清单：relative path + 期望类型
+const NATIVE_OVERLAY = [
+    { rel: 'resources/default_app.asar', kind: 'file' },
+    { rel: 'resources/workbuddy-editor-sdk-supervisor', kind: 'file' },
+    { rel: 'resources/wb-storage-shim.cjs', kind: 'file' },
+    { rel: 'resources/apparmor-profile', kind: 'file' },
+    { rel: 'resources/tray-linux.png', kind: 'file' },
+    { rel: 'resources/tray-linux@2x.png', kind: 'file' },
+    { rel: 'resources/node_modules', kind: 'dir', optional: true },
+    { rel: 'resources/app.asar.unpacked/resources/im-backend-cmd/im-napi.node', kind: 'file' },
+    { rel: 'resources/app.asar.unpacked/node_modules/@genie/im-channels-native', kind: 'dir' },
+    { rel: 'resources/app.asar.unpacked/node_modules/koffi/build/koffi/linux_loong64', kind: 'dir' },
+    { rel: 'resources/app.asar.unpacked/node_modules/node-pty/build', kind: 'dir', optional: true },
+    { rel: 'resources/app.asar.unpacked/node_modules/node-pty/prebuilds/linux-loong64', kind: 'dir' },
+    { rel: 'resources/app.asar.unpacked/node_modules/@lydell/node-pty-linux-loong64', kind: 'dir' },
+    { rel: 'resources/app.asar.unpacked/cli/node_modules/@lydell/node-pty-linux-loong64', kind: 'dir' },
+];
+const VENDOR_ARCH_DIRS = ['linux-loong64', 'linux-loongarch64', 'loong64-linux', 'loongarch64-linux'];
+const VENDOR_TOOLS = ['ripgrep', 'genie-trash'];
+
+const ELF_MACHINE = { 62: 'x86-64', 183: 'aarch64', 258: 'loongarch64' };
+
+function readMagicKind(file) {
+    let fd;
+    try {
+        fd = fs.openSync(file, 'r');
+        const buf = Buffer.alloc(20);
+        const n = fs.readSync(fd, buf, 0, 20, 0);
+        if (n < 4) return { kind: 'empty' };
+        if (buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) {
+            const m = n >= 20 ? buf.readUInt16LE(18) : 0;
+            return { kind: 'elf', machine: ELF_MACHINE[m] || ('elf-machine-' + m) };
+        }
+        if (buf[0] === 0xcf || buf[0] === 0xce || buf[0] === 0xca || buf[0] === 0xfe) return { kind: 'macho' };
+        if (buf[0] === 0x4d && buf[1] === 0x5a) return { kind: 'pe' };
+        return { kind: 'data' };
+    } catch (err) {
+        return { kind: 'unreadable', error: err.message };
+    } finally {
+        try { fs.closeSync(fd); } catch (_) {}
+    }
+}
+
+function walkTree(root, relBase, visitor) {
+    if (!fs.existsSync(root)) return;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        const rel = relBase ? relBase + '/' + entry.name : entry.name;
+        const abs = path.join(root, entry.name);
+        if (entry.isDirectory()) {
+            visitor(rel, abs, true);
+            walkTree(abs, rel, visitor);
+        } else {
+            visitor(rel, abs, false);
+        }
+    }
+}
+
+function copyInto(src, dst, rel) {
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.cpSync(src, dst, { recursive: true, force: true, preserveTimestamps: true, verbatimSymlinks: true });
+    log('  + ' + rel);
+}
+
+function runLayoutStage() {
+    const outDir = path.resolve(FLAGS.layoutOut);
+    const appDir = FLAGS.layoutApp
+        ? path.resolve(FLAGS.layoutApp)
+        : path.resolve(asarPath, '..', '..', '..'); // Resources/app.asar → Contents → X.app
+    const srcResources = path.join(appDir, 'Contents', 'Resources');
+    if (!fs.existsSync(srcResources)) {
+        console.error('[apply-linux-patches] ERROR: --layout 需要 .app 目录（找不到 ' + srcResources + '）');
+        process.exit(2);
+    }
+    const runtimeFrom = FLAGS.runtimeFrom && fs.existsSync(FLAGS.runtimeFrom) ? path.resolve(FLAGS.runtimeFrom) : '';
+    const nativeFrom = FLAGS.nativeFrom && fs.existsSync(FLAGS.nativeFrom) ? path.resolve(FLAGS.nativeFrom) : '';
+    if (!runtimeFrom) {
+        console.error('[apply-linux-patches] ERROR: --layout 需要 --runtime-from 指向 loong64 Electron 运行时目录（默认 /opt/WorkBuddy 不存在）');
+        process.exit(2);
+    }
+
+    log('=== 转换阶段：' + path.basename(appDir) + ' → ' + outDir + ' (' + TARGET_ARCH + ') ===');
+    const report = { app: appDir, out: outDir, arch: TARGET_ARCH, runtimeFrom, nativeFrom, pruned: 0, overlays: [], runtimeFiles: [], notes: [] };
+    fs.mkdirSync(outDir, { recursive: true });
+
+    // A. Resources 树整体搬运（app.asar 也一起搬，后面原地打补丁）
+    const outResources = path.join(outDir, 'resources');
+    fs.cpSync(srcResources, outResources, { recursive: true, force: true, preserveTimestamps: true });
+
+    // B. 剔除 mac 专属物
+    const toPrune = [];
+    walkTree(outResources, '', (rel, abs) => {
+        const why = isMacOnlyPath(rel);
+        if (why) toPrune.push({ rel, abs, why });
+    });
+    for (const p of toPrune.sort((a, b) => a.rel.split('/').length - b.rel.split('/').length)) {
+        if (!fs.existsSync(p.abs)) continue;
+        try { fs.rmSync(p.abs, { recursive: true, force: true }); report.pruned++; }
+        catch (err) { report.notes.push('prune ' + p.rel + ': ' + err.message); }
+    }
+    log('剔除 mac 专属条目 ' + report.pruned + ' 个');
+
+    // C1. Electron 运行时（loong64）
+    const runtimeFiles = [
+        'electron', 'chrome_100_percent.pak', 'chrome_200_percent.pak', 'chrome-sandbox',
+        'chrome_crashpad_handler', 'icudtl.dat', 'libEGL.so', 'libGLESv2.so', 'libffmpeg.so',
+        'libvk_swiftshader.so', 'libvulkan.so.1', 'resources.pak', 'snapshot_blob.bin',
+        'v8_context_snapshot.bin', 'vk_swiftshader_icd.json', 'version', 'LICENSE',
+        'LICENSES.chromium.html',
+    ];
+    for (const f of runtimeFiles) {
+        const src = path.join(runtimeFrom, f);
+        if (!fs.existsSync(src)) { report.notes.push('runtime 缺少 ' + f); continue; }
+        fs.cpSync(src, path.join(outDir, f), { force: true });
+        fs.chmodSync(path.join(outDir, f), fs.statSync(src).mode & 0o777);
+        report.runtimeFiles.push(f);
+    }
+    if (fs.existsSync(path.join(runtimeFrom, 'locales'))) {
+        fs.cpSync(path.join(runtimeFrom, 'locales'), path.join(outDir, 'locales'), { recursive: true, force: true });
+        report.runtimeFiles.push('locales/');
+    }
+    // 启动器与 shim：优先复用来源目录里已验证的版本。
+    // 注意来源里的 workbuddy 把安装路径写死成 DIR="/opt/WorkBuddy"，直接搬过来
+    // 会去跑原来那份 electron。这里改写成"脚本自身所在目录"，让输出目录可搬迁。
+    const launchers = ['run.sh', 'workbuddy'];
+    for (const f of launchers) {
+        const src = path.join(runtimeFrom, f);
+        if (!fs.existsSync(src)) { report.notes.push('缺少启动器 ' + f); continue; }
+        let text = fs.readFileSync(src, 'utf8');
+        const rewritten = text
+            .replace(/^DIR="\/opt\/[^"]*"$/m, 'DIR="$(cd "$(dirname "$0")" && pwd)"')
+            .replace(/^DIR=\/opt\/\S*$/m, 'DIR="$(cd "$(dirname "$0")" && pwd)"');
+        if (rewritten !== text) {
+            report.notes.push(f + ': 安装路径常量改写为脚本所在目录');
+            text = rewritten;
+        }
+        const dst = path.join(outDir, f);
+        fs.writeFileSync(dst, text);
+        fs.chmodSync(dst, 0o755);
+        report.runtimeFiles.push(f);
+    }
+    log('Electron 运行时文件 ' + report.runtimeFiles.length + ' 项 → ' + outDir);
+
+    // C2. loong64 原生模块覆盖
+    for (const item of NATIVE_OVERLAY) {
+        const src = path.join(nativeFrom, item.rel);
+        const dst = path.join(outDir, item.rel);
+        if (!fs.existsSync(src)) {
+            if (!item.optional) report.notes.push('native 缺少 ' + item.rel);
+            continue;
+        }
+        fs.rmSync(dst, { recursive: true, force: true });
+        copyInto(src, dst, item.rel);
+        report.overlays.push(item.rel);
+    }
+    for (const tool of VENDOR_TOOLS) {
+        for (const base of ['resources/app.asar.unpacked/cli/vendor', 'resources/vendor']) {
+            for (const d of VENDOR_ARCH_DIRS) {
+                const src = path.join(nativeFrom, base, tool, d);
+                if (!fs.existsSync(src)) continue;
+                copyInto(src, path.join(outDir, base, tool, d), base + '/' + tool + '/' + d);
+                report.overlays.push(base + '/' + tool + '/' + d);
+            }
+        }
+    }
+
+    // C3. pty.node 架构校验/兜底：本机曾踩过"mac/glibc 不匹配但报错指向缺失路径"的坑，
+    //     这里至少把非 loongarch64 的 pty.node 换成参考安装里的那份。
+    const refPtyNode = (() => {
+        const candidates = [
+            path.join(nativeFrom, 'resources/app.asar.unpacked/node_modules/node-pty/build/Release/pty.node'),
+            path.join(nativeFrom, 'resources/app.asar.unpacked/node_modules/node-pty/prebuilds/linux-loong64/pty.node'),
+            path.join(nativeFrom, 'resources/app.asar.unpacked/node_modules/@lydell/node-pty-linux-loong64/prebuilds/linux-loong64/pty.node'),
+        ];
+        for (const c of candidates) {
+            if (fs.existsSync(c) && readMagicKind(c).machine === 'loongarch64') return c;
+        }
+        return '';
+    })();
+    walkTree(outDir, '', (rel, abs, isDir) => {
+        if (isDir || path.basename(rel) !== 'pty.node') return;
+        // 只处理"本架构该用"的那几处：node-pty 的加载顺序是
+        // build/Release → build/Debug → prebuilds/<platform>-<arch>。
+        // 其它平台目录（prebuilds/linux-x64、darwin-*）保持原样，别乱改。
+        if (!/build\/(Release|Debug)\//.test(rel) &&
+            !/prebuilds\/(linux[-_](loong64|loongarch64)|(loong64|loongarch64)[-_]linux)\//.test(rel)) return;
+        const magic = readMagicKind(abs);
+        if (magic.machine === 'loongarch64') return;
+        if (refPtyNode) {
+            fs.cpSync(refPtyNode, abs, { force: true });
+            report.notes.push('pty.node 架构为 ' + (magic.machine || magic.kind) + '，已替换为参考 loong64 版本：' + rel);
+        } else {
+            report.notes.push('pty.node 架构为 ' + (magic.machine || magic.kind) + '，且无参考 loong64 版本可替换：' + rel);
+        }
+    });
+
+    // C4. 原生件架构体检
+    //
+    // 只把"本平台该用却架构不对"的文件当问题。其它平台的 prebuild / win32 资源
+    // 留在树里不影响 Linux 运行（也不会被 require），单独计数即可。
+    const OTHER_PLATFORM_RE = /(prebuilds|build|vendor|bin)\/(linux[-_](x64|ia32|arm64|armhf|riscv64)|darwin|win32|musl|freebsd|openbsd)\/|(^|[-_/.])darwin|win32|\.(dll|exe)$/i;
+    const archCheck = { pinned: 0, otherPlatform: 0, leftover: [] };
+    walkTree(outResources, '', (rel, abs, isDir) => {
+        if (isDir) return;
+        if (!/\.(node|so|so\.[0-9.]+)$/.test(rel)) return;
+        const m = readMagicKind(abs);
+        if (m.kind === 'elf' && m.machine === 'loongarch64') { archCheck.pinned++; return; }
+        if (OTHER_PLATFORM_RE.test(rel)) { archCheck.otherPlatform++; return; }
+        archCheck.leftover.push(rel + ' (' + (m.machine || m.kind) + ')');
+    });
+    report.archCheck = archCheck;
+    log('原生件体检：loongarch64=' + archCheck.pinned +
+        '，其它平台（应保留/惰性）=' + archCheck.otherPlatform +
+        '，可疑=' + archCheck.leftover.length);
+    for (const f of archCheck.leftover.slice(0, 10)) warn('架构可疑的原生件: ' + f);
+
+    const reportPath = path.join(outDir, 'convert-report.json');
+    if (!FLAGS.dryRun) fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    log('转换报告：' + reportPath);
+
+    // 后续 asar 补丁直接作用在新树上
+    asarPath = path.join(outResources, 'app.asar');
+    return report;
+}
+
+if (FLAGS.layoutOut && !FLAGS.dryRun) runLayoutStage();
+else if (FLAGS.layoutOut && FLAGS.dryRun) log('--dry-run：跳过转换阶段（本来会输出到 ' + FLAGS.layoutOut + '）');
+
 if (!fs.existsSync(asarPath)) {
     console.error('[apply-linux-patches] ERROR: asar file not found: ' + asarPath);
     process.exit(2);
@@ -161,6 +602,65 @@ function walk(node, prefix) {
 }
 walk(header, '');
 log('Extracted ' + unpackedFiles.length + ' unpacked + packed entries to temp dir');
+
+// ---------------------------------------------------------------------------
+// 1b. 能力探测（capability probe）
+//
+// 上游把当年这些补丁的动机自己修掉之后，继续注入只会白改代码、并把
+// "锚点没找到" 的噪音当成错误。这里一次性读完全部主进程 JS，按特征判定
+// 哪些能力已经由上游提供；补丁段落据此跳过并标记 upstream-native。
+// ---------------------------------------------------------------------------
+const mainModulesDir = path.join(tmpDir, 'main');
+function collectJs(root, relBase, acc) {
+    if (!fs.existsSync(root)) return acc;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        const abs = path.join(root, entry.name);
+        if (entry.isDirectory()) collectJs(abs, relBase ? relBase + '/' + entry.name : entry.name, acc);
+        else if (entry.name.endsWith('.js')) {
+            try { acc.push({ rel: (relBase ? relBase + '/' : '') + entry.name, text: fs.readFileSync(abs, 'utf8') }); } catch (_) {}
+        }
+    }
+    return acc;
+}
+const mainModules = collectJs(mainModulesDir, '', []);
+const mainCorpus = mainModules.map(m => m.text).join('\n');
+function anyMain(re) { return mainModules.some(m => re.test(m.text)); }
+
+const CAPS = {
+    // 上游把 ACC_PRODUCT_CONFIG_* 落盘到私有文件，用 _PATH 传递 → E2BIG 不再出现
+    productConfigSpill:
+        /ACC_PRODUCT_CONFIG_PATH/.test(mainCorpus) &&
+        /workbuddy-product-spill|acc-product-config-v3\.json/.test(mainCorpus),
+    // TrayController 自带 linux 分支：setContextMenu(buildFallbackMenu()) + tray-linux.png
+    linuxTray:
+        /this\.tray\.setContextMenu\(/.test(mainCorpus) &&
+        /tray-linux/.test(mainCorpus),
+    // 独立的 linux 更新服务（AppImage 自更新，按 linuxSelfUpdateSupported 门控）
+    linuxUpdateService: fs.existsSync(path.join(mainModulesDir, 'update-service.linux.js')),
+    // isCliInstalled 的 `which` 检查自带 exec timeout
+    cliExecTimeout: anyMain(/isCliInstalled/) && anyMain(/timeout:\s*5e3\s*,\s*env/),
+    // window-all-closed 已按平台分支（非 darwin 且有托盘时保留进程）
+    lifecyclePlatformAware: anyMain(/process\.platform\s*!==\s*[`"']darwin[`"']/),
+    // 主进程已拆模块（5.9.x 形态）
+    moduleSplit: fs.existsSync(path.join(mainModulesDir, 'main-bootstrap.js')),
+};
+patchReport.capabilities = CAPS;
+log('上游能力探测: ' + Object.entries(CAPS).map(([k, v]) => k + '=' + (v ? 'yes' : 'no')).join(', '));
+patchReport.moduleCount = mainModules.length;
+
+// 转换模式下，把 asar 内的 mac 专属条目也删掉：只删磁盘 sidecar 是不够的，
+// asar header 仍声明它们 unpacked，repack 后的 sidecar 同步会把它们再写回来。
+// 它们只会在 macOS 上被 require，Linux 下属于纯负担（体积 + 混淆架构体检）。
+if (FLAGS.layoutOut) {
+    let prunedInAsar = 0;
+    walkTree(tmpDir, '', (rel, abs) => {
+        if (!isMacOnlyPath(rel)) return;
+        try { fs.rmSync(abs, { recursive: true, force: true }); prunedInAsar++; } catch (_) {}
+    });
+    log('asar 内剔除 mac 专属条目: ' + prunedInAsar);
+    patchReport.prunedInAsar = prunedInAsar;
+}
+
 
 // ---------------------------------------------------------------------------
 // 2. Apply the two source patches to main/index.js.
@@ -577,19 +1077,45 @@ const SHIM_BODY = `// ${marker} — WorkBuddy Linux runtime patches (env + tray 
 if (source.includes(marker)) {
     log('marker already present in main/index.js; skipping source patch');
     markRequired('mainEnvShim', true);
-    markRequired('trayContextMenu', true);
-    markRequired('trayIconPath', true);
+    markOptional('trayContextMenu', true);
+    markOptional('trayIconPath', true);
 } else {
-    const shim = SHIM_BODY;
-    source = shim + source;
-    markRequired('mainEnvShim', true);
+    const envShimNeeded = FLAGS.forceEnvShim || !CAPS.productConfigSpill;
+    if (envShimNeeded) {
+        const shim = SHIM_BODY;
+        source = shim + source;
+        markRequired('mainEnvShim', true);
+    } else {
+        // 5.9.x：上游把 ~260KB 的产品配置落盘，改用 ACC_PRODUCT_CONFIG_PATH 传给子进程，
+        // E2BIG 场景消失（module-base.js 的 workbuddy-product-spill-*）。
+        // 继续注入 shim 只会覆盖 process.env，反而有风险，故跳过。
+        markUpstream('mainEnvShim', '上游用 ACC_PRODUCT_CONFIG_PATH 落盘传递产品配置，无需 E2BIG shim（--force-env-shim 可强制）', true);
+    }
 
     const trayMarker = 'this.tray = new electron.Tray(trayIcon);';
     const trayIdx = source.indexOf(trayMarker);
-    if (trayIdx < 0) {
-        console.error('[apply-linux-patches] ERROR: tray construction line not found');
-        process.exit(4);
-    }
+    // [loong64] 5.6.2 ships a native TrayController class (same as 5.8.x)
+    // and this.tray = new electron.Tray(trayIcon) appears INSIDE a method
+    // of it (class declaration precedes the marker). The legacy top-level
+    // contextMenu declaration no longer exists, so the Fix 2/3 patches
+    // below are obsolete for this layout. Detect that by checking whether
+    // 'var TrayController = class' appears BEFORE the tray marker.
+    const trayInsideController = (function () {
+        const innerLoc = source.indexOf('var TrayController = class');
+        return innerLoc >= 0 && trayIdx > innerLoc;
+    })();
+    if (CAPS.linuxTray) {
+        // 5.9.x 的 TrayController 已有 linux 分支：setContextMenu(buildFallbackMenu())
+        // 且直接用 tray-linux.png，Fix 2/3 的动机不复存在。
+        markUpstream('trayContextMenu', '上游 TrayController 已内置 linux setContextMenu 分支', false);
+        markUpstream('trayIconPath', '上游已按 tray-linux.png 构造 Linux 托盘图标', false);
+    } else if (trayIdx < 0 || trayInsideController) {
+        // tray construction is not in main/index.js at the legacy top-level
+        // spot (moved to TrayController, which already ships native Linux
+        // tray support); skip the legacy tray patches instead of aborting.
+        markAnchorGone('trayContextMenu', '托盘构造不在 main/index.js 顶层（已迁入 TrayController）');
+        markAnchorGone('trayIconPath', '同上：托盘构造锚点缺失');
+    } else {
     const afterTray = source.slice(trayIdx);
     const contextMenuDeclRe = /const contextMenu = electron\.Menu\.buildFromTemplate\(\[[\s\S]*?\]\);/;
     const m = afterTray.match(contextMenuDeclRe);
@@ -603,7 +1129,7 @@ if (source.includes(marker)) {
         '\t\t\t\ttry { this.tray.setContextMenu(contextMenu); } catch (_) {}\n' +
         '\t\t\t}';
     source = source.slice(0, insertAt) + trayPatch + source.slice(insertAt);
-    markRequired('trayContextMenu', true);
+    markOptional('trayContextMenu', true);
 
     // Fix 3 (Linux): the tray icon renders as a missing-image placeholder
     // (exclamation mark on Mint/Cinnamon) because upstream hands
@@ -632,9 +1158,10 @@ if (source.includes(marker)) {
         source = source.slice(0, trayIdx2)
             + trayConstructReplacement
             + source.slice(trayIdx2 + trayConstruct.length);
-        markRequired('trayIconPath', true);
+        markOptional('trayIconPath', true);
     } else {
-        markRequired('trayIconPath', false);
+        markOptional('trayIconPath', false);
+    }
     }
 
     // -----------------------------------------------------------------------
@@ -766,7 +1293,7 @@ if (source.includes(marker)) {
             + source.slice(updateMenuIdx + updateMenuMarker.length);
         markOptional('updateMenuDisabled', true);
     } else {
-        console.error('[apply-linux-patches] ERROR: updateMenuDisabled anchor not found; skipping (menu-item builder moved to renderer bundle in 5.3.3; update RPCs/services still stubbed)');
+        warn('锚点缺失（上游已改写或本版本不存在）: updateMenuDisabled anchor not found; skipping (menu-item builder moved to renderer bundle in 5.3.3; update RPCs/services still stubbed)')
         markOptional('updateMenuDisabled', false);
     }
 
@@ -776,56 +1303,141 @@ if (source.includes(marker)) {
     // v5.2.3+ changed 'registerUpdateHandlers(server, deps)' to
     // 'registerUpdateHandlers(registry, deps)' and 'handleRpc$1' to
     // 'handleRpc'. Try both patterns for forward/backward compat.
-    const updateRpcMarkerOld = 'function registerUpdateHandlers(server, deps) {';
-    const updateRpcMarkerNew = 'function registerUpdateHandlers(registry, deps) {';
-    let updateRpcIdx = source.indexOf(updateRpcMarkerOld);
-    let useNewPattern = false;
-    if (updateRpcIdx < 0) {
-        updateRpcIdx = source.indexOf(updateRpcMarkerNew);
-        useNewPattern = true;
-    }
-    if (updateRpcIdx >= 0) {
-        const marker = useNewPattern ? updateRpcMarkerNew : updateRpcMarkerOld;
-        const rpcFn = useNewPattern
-            ? 'require_workbuddy_auth_product_coordinator.handleRpc(registry,'
-            : 'handleRpc$1(server,';
-        const linuxRpcShim =
-            marker + '\n' +
-            '\tif (process.platform === "linux") {\n' +
-            '\t\t' + rpcFn + ' "updateCheck", async () => {});\n' +
-            '\t\t' + rpcFn + ' "updateDownload", async () => {});\n' +
-            '\t\t' + rpcFn + ' "updateArchMismatchDownload", async () => {});\n' +
-            '\t\t' + rpcFn + ' "updateArchMismatchInstall", async () => {});\n' +
-            '\t\t' + rpcFn + ' "updateQuitAndInstall", async () => {});\n' +
-            '\t\t' + rpcFn + ' "updateGetState", async () => ({ state: "idle" }));\n' +
-            '\t\treturn;\n' +
-            '\t}';
-        source = source.slice(0, updateRpcIdx)
-            + linuxRpcShim
-            + source.slice(updateRpcIdx + marker.length);
-        markRequired('updateRpcDisabled', true);
-    } else {
-        markRequired('updateRpcDisabled', false);
+    // 5.8.x moved update handling into dedicated modules:
+    //   - registerUpdateHandlers() -> main/main-bootstrap.js
+    //   - UpdateServiceLinux       -> main/update-service.linux.js (AppImage updater)
+    // Patch those files directly when present; otherwise fall back to the
+    // legacy main/index.js anchors used by 4.x/5.0-5.3.
+    const bootstrapPath = path.join(tmpDir, 'main', 'main-bootstrap.js');
+    const updateSvcPath = path.join(tmpDir, 'main', 'update-service.linux.js');
+    let updateRpcDone = false;
+    let updateRpcDetail = '';
+    let updateServiceDone = false;
+
+    // 5.9.x 的主进程是重命名压缩过的：RPC 注册函数不再是 require_netdrive_env_route.Ni，
+    // 而是 require_handler_registry.t（同一文件里 50+ 处）。旧版本注入的 Ni(...) 在
+    // 5.9.x 上是**静默空转**——try/catch 吞掉 ReferenceError，补丁却报告成功。
+    // 这里改为：从目标文件里反查真正的注册函数名，找不到就如实报 anchor-gone。
+    function findRpcRegistrar(text, serverArg) {
+        const esc = serverArg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(
+            '([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*){0,2})\\(\\s*' + esc + '\\s*,\\s*"updateCheck"'
+        );
+        const m = text.match(re) || text.match(new RegExp(
+            '([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*){0,2})\\(\\s*' + esc + '\\s*,\\s*`updateCheck`'
+        ));
+        return m ? m[1] : '';
     }
 
-    // Also stub out UpdateServiceLinux.checkForUpdates so the automatic
-    // background update check (triggered by UpdateService.start()) does
-    // not fire HTTP requests to a macOS/Windows feed URL.
-    const linuxUpdateClassMarker = 'UpdateServiceLinux = class extends AbstractUpdateService {';
-    const linuxUpdateClassIdx = source.indexOf(linuxUpdateClassMarker);
-    if (linuxUpdateClassIdx >= 0) {
-        const checkMethodMarker = 'async checkForUpdates(explicit = false) {';
-        const checkMethodIdx = source.indexOf(checkMethodMarker, linuxUpdateClassIdx);
-        if (checkMethodIdx >= 0) {
-            const afterCheck = checkMethodIdx + checkMethodMarker.length;
-            const earlyReturn = '\n\t\t\t\t\t// [wb-linux-patch] Auto-update disabled on Linux port\n\t\t\t\t\treturn;\n';
-            source = source.slice(0, afterCheck) + earlyReturn + source.slice(afterCheck);
-            markRequired('updateServiceDisabled', true);
-        } else {
-            markRequired('updateServiceDisabled', false);
+    function patchUpdateRpcIn(filePath, text) {
+        if (text.includes('[wb-linux-patch] update RPC disabled')) {
+            return { ok: true, detail: 'marker 已存在' };
         }
+        const decl = text.match(/function registerUpdateHandlers\(([^)]*)\)\s*\{/);
+        if (!decl) return { ok: false, detail: '找不到 registerUpdateHandlers 定义' };
+        const serverArg = decl[1].split(',')[0].trim();
+        const registrar = findRpcRegistrar(text, serverArg);
+        if (!registrar) {
+            return { ok: false, detail: '找不到 RPC 注册函数（' + serverArg + ', "updateCheck"），拒绝注入空转代码' };
+        }
+        const inject =
+            decl[0] +
+            '\n// [wb-linux-patch] update RPC disabled\n' +
+            '\tif (process.platform === "linux") {\n' +
+            '\t\tconst __wbNoopRpc = async () => {};\n' +
+            '\t\tfor (const __wbCh of ["updateCheck","updateDownload","updateArchMismatchDownload","updateArchMismatchInstall","updateQuitAndInstall"]) {\n' +
+            '\t\t\ttry { ' + registrar + '(' + serverArg + ', __wbCh, __wbNoopRpc); } catch (_) {}\n' +
+            '\t\t}\n' +
+            '\t\ttry { ' + registrar + '(' + serverArg + ', "updateGetState", async () => ({ state: "idle" })); } catch (_) {}\n' +
+            '\t\treturn;\n' +
+            '\t}';
+        fs.writeFileSync(filePath, text.replace(decl[0], inject));
+        return { ok: true, detail: 'registrar=' + registrar };
+    }
+
+    if (fs.existsSync(bootstrapPath)) {
+        const r = patchUpdateRpcIn(bootstrapPath, fs.readFileSync(bootstrapPath, 'utf8'));
+        updateRpcDone = r.ok;
+        updateRpcDetail = 'main-bootstrap.js: ' + r.detail;
+    }
+
+    // linux 更新服务：5.9.x 自带 update-service.linux.js（AppImage 自更新，且由
+    // linuxSelfUpdateSupported 门控）。deb/rpm 安装下它本来就不会真的更新，
+    // 强行插 early-return 只会让"检查更新"彻底失去语义，故跳过。
+    if (CAPS.linuxUpdateService) {
+        markUpstream('updateServiceDisabled', '上游已有 main/update-service.linux.js 且按 linuxSelfUpdateSupported 门控', false);
+        updateServiceDone = true;
+    } else if (fs.existsSync(updateSvcPath)) {
+        let svc = fs.readFileSync(updateSvcPath, 'utf8');
+        if (svc.includes('[wb-linux-patch] auto-update disabled')) {
+            updateServiceDone = true;
+        } else {
+            const decl = svc.match(/checkForUpdates\(([^)]*)\)\{/);
+            if (decl) {
+                svc = svc.replace(
+                    decl[0],
+                    decl[0] + '\n/* [wb-linux-patch] auto-update disabled */return;'
+                );
+                fs.writeFileSync(updateSvcPath, svc);
+                updateServiceDone = true;
+            }
+        }
+    }
+
+    if (!updateRpcDone) {
+        const updateRpcMarkerOld = 'function registerUpdateHandlers(server, deps) {';
+        const updateRpcMarkerNew = 'function registerUpdateHandlers(registry, deps) {';
+        let updateRpcIdx = source.indexOf(updateRpcMarkerOld);
+        let useNewPattern = false;
+        if (updateRpcIdx < 0) {
+            updateRpcIdx = source.indexOf(updateRpcMarkerNew);
+            useNewPattern = true;
+        }
+        if (updateRpcIdx >= 0) {
+            const marker = useNewPattern ? updateRpcMarkerNew : updateRpcMarkerOld;
+            const rpcFn = useNewPattern
+                ? 'require_workbuddy_auth_product_coordinator.handleRpc(registry,'
+                : 'handleRpc$1(server,';
+            const linuxRpcShim =
+                marker + '\n' +
+                '\tif (process.platform === "linux") {\n' +
+                '\t\t' + rpcFn + ' "updateCheck", async () => {});\n' +
+                '\t\t' + rpcFn + ' "updateDownload", async () => {});\n' +
+                '\t\t' + rpcFn + ' "updateArchMismatchDownload", async () => {});\n' +
+                '\t\t' + rpcFn + ' "updateArchMismatchInstall", async () => {});\n' +
+                '\t\t' + rpcFn + ' "updateQuitAndInstall", async () => {});\n' +
+                '\t\t' + rpcFn + ' "updateGetState", async () => ({ state: "idle" }));\n' +
+                '\t\treturn;\n' +
+                '\t}';
+            source = source.slice(0, updateRpcIdx)
+                + linuxRpcShim
+                + source.slice(updateRpcIdx + marker.length);
+            updateRpcDone = true;
+        }
+    }
+    if (updateRpcDone) {
+        setPatch('updateRpcDisabled', STATUS.APPLIED, updateRpcDetail || 'registerUpdateHandlers 已打桩', true);
     } else {
-        markRequired('updateServiceDisabled', false);
+        markAnchorGone('updateRpcDisabled', updateRpcDetail || '未找到 registerUpdateHandlers / RPC 注册函数');
+    }
+
+    if (!updateServiceDone) {
+        const linuxUpdateClassMarker = 'UpdateServiceLinux = class extends AbstractUpdateService {';
+        const linuxUpdateClassIdx = source.indexOf(linuxUpdateClassMarker);
+        if (linuxUpdateClassIdx >= 0) {
+            const checkMethodMarker = 'async checkForUpdates(explicit = false) {';
+            const checkMethodIdx = source.indexOf(checkMethodMarker, linuxUpdateClassIdx);
+            if (checkMethodIdx >= 0) {
+                const afterCheck = checkMethodIdx + checkMethodMarker.length;
+                const earlyReturn = '\n\t\t\t\t\t// [wb-linux-patch] Auto-update disabled on Linux port\n\t\t\t\t\treturn;\n';
+                source = source.slice(0, afterCheck) + earlyReturn + source.slice(afterCheck);
+                updateServiceDone = true;
+            }
+        }
+    }
+    if (!CAPS.linuxUpdateService) {
+        if (updateServiceDone) markOptional('updateServiceDisabled', true);
+        else markAnchorGone('updateServiceDisabled', '未找到 UpdateServiceLinux.checkForUpdates / main/update-service.linux.js');
     }
 
     // -----------------------------------------------------------------------
@@ -905,7 +1517,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + mcpInjectTo + source.slice(idx + mcpInjectFrom.length);
             markOptional('mcpInjectNodeRuntimeTimeout', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: mcpInjectNodeRuntimeTimeout anchor not found; skipping (stdio MCP startup may stall on hung BinaryManager)');
+            warn('锚点缺失（上游已改写或本版本不存在）: mcpInjectNodeRuntimeTimeout anchor not found; skipping (stdio MCP startup may stall on hung BinaryManager)')
             markOptional('mcpInjectNodeRuntimeTimeout', false);
         }
     }
@@ -948,7 +1560,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + cliBuildEnvTo + source.slice(idx + cliBuildEnvFrom.length);
             markOptional('cliBuildCommandEnvTimeout', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: cliBuildCommandEnvTimeout anchor not found; skipping (CLI preAuth may stall on hung BinaryManager)');
+            warn('锚点缺失（上游已改写或本版本不存在）: cliBuildCommandEnvTimeout anchor not found; skipping (CLI preAuth may stall on hung BinaryManager)')
             markOptional('cliBuildCommandEnvTimeout', false);
         }
     }
@@ -1001,7 +1613,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + cliIsInstalledTo + source.slice(idx + cliIsInstalledFrom.length);
             markOptional('cliIsCliInstalledTimeout', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: cliIsCliInstalledTimeout anchor not found; skipping (which/where check may hang indefinitely on Linux)');
+            warn('锚点缺失（上游已改写或本版本不存在）: cliIsCliInstalledTimeout anchor not found; skipping (which/where check may hang indefinitely on Linux)')
             markOptional('cliIsCliInstalledTimeout', false);
         }
     }
@@ -1062,15 +1674,15 @@ if (source.includes(marker)) {
                     source = source.slice(0, indentStart) + replacement + source.slice(endIdx);
                     markOptional('connectorPreAuthTimeout', true);
                 } else {
-                    console.error('[apply-linux-patches] ERROR: connectorPreAuthTimeout end-brace not found; skipping');
+                    warn('锚点缺失（上游已改写或本版本不存在）: connectorPreAuthTimeout end-brace not found; skipping')
                     markOptional('connectorPreAuthTimeout', false);
                 }
             } else {
-                console.error('[apply-linux-patches] ERROR: connectorPreAuthTimeout if/successCheck not found near runPreCliAuth call; skipping');
+                warn('锚点缺失（上游已改写或本版本不存在）: connectorPreAuthTimeout if/successCheck not found near runPreCliAuth call; skipping')
                 markOptional('connectorPreAuthTimeout', false);
             }
         } else {
-            console.error('[apply-linux-patches] ERROR: connectorPreAuthTimeout runPreCliAuth call not found; skipping (CLI preAuth may stall the connect pipeline)');
+            warn('锚点缺失（上游已改写或本版本不存在）: connectorPreAuthTimeout runPreCliAuth call not found; skipping (CLI preAuth may stall the connect pipeline)')
             markOptional('connectorPreAuthTimeout', false);
         }
     }
@@ -1126,7 +1738,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + composeTo + source.slice(idx + composeFrom.length);
             markOptional('composePromptForBackendTimeout', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: composePromptForBackendTimeout anchor not found; skipping (first chat message may hang)');
+            warn('锚点缺失（上游已改写或本版本不存在）: composePromptForBackendTimeout anchor not found; skipping (first chat message may hang)')
             markOptional('composePromptForBackendTimeout', false);
         }
     }
@@ -1174,7 +1786,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + resolveTo + source.slice(idx + resolveFrom.length);
             markOptional('resolveRuntimeConfigTimeout', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: resolveRuntimeConfigTimeout anchor not found; skipping (first session start may hang)');
+            warn('锚点缺失（上游已改写或本版本不存在）: resolveRuntimeConfigTimeout anchor not found; skipping (first session start may hang)')
             markOptional('resolveRuntimeConfigTimeout', false);
         }
     }
@@ -1210,7 +1822,7 @@ if (source.includes(marker)) {
             source = source.slice(0, idx) + clawRuntimePluginRegistrationReplayTo + source.slice(idx + clawRuntimePluginRegistrationReplayFrom.length);
             markOptional('wechatmpPluginRegistrationReplay', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: wechatmpPluginRegistrationReplay anchor not found; skipping (registered wechatmp plugin may not trigger remote replay)');
+            warn('锚点缺失（上游已改写或本版本不存在）: wechatmpPluginRegistrationReplay anchor not found; skipping (registered wechatmp plugin may not trigger remote replay)')
             markOptional('wechatmpPluginRegistrationReplay', false);
         }
     }
@@ -1264,7 +1876,7 @@ if (source.includes(marker)) {
         } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
             markOptional('networkDiagnosticsTimeouts', true);
         } else {
-            console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
+            warn('锚点缺失（上游已改写或本版本不存在）: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task')
             markOptional('networkDiagnosticsTimeouts', false);
         }
     }
@@ -1323,7 +1935,7 @@ if (!patchReport.required.networkDiagnosticsTimeouts && !patchReport.optional?.n
     } else if (source.includes('async runCheckWithTimeout(name, task, timeoutMs)')) {
         markOptional('networkDiagnosticsTimeouts', true);
     } else {
-        console.error('[apply-linux-patches] ERROR: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task');
+        warn('锚点缺失（上游已改写或本版本不存在）: networkDiagnosticsTimeouts anchor not found; network diagnostics may stay stuck on a hung DNS/ping/probe task')
         markOptional('networkDiagnosticsTimeouts', false);
     }
 }
@@ -1546,7 +2158,11 @@ assertRequiredPatches();
 // a stale bootstrap value.
 // ---------------------------------------------------------------------------
 const sidecarEntryPath = path.join(tmpDir, 'main', 'sidecar-entry.js');
-if (fs.existsSync(sidecarEntryPath)) {
+if (CAPS.productConfigSpill && !FLAGS.forceEnvShim) {
+    // 上游既然用 ACC_PRODUCT_CONFIG_PATH 传配置，sidecar 侧没有 _FILE 指针要 reclaim，
+    // 再注入 shim 反而会遮蔽上游的 env 读取逻辑。
+    markUpstream('sidecarEnvShim', '上游 config spill 走 _PATH，sidecar 无需 shim', true);
+} else if (fs.existsSync(sidecarEntryPath)) {
     let sidecarSource = fs.readFileSync(sidecarEntryPath, 'utf8');
     if (!sidecarSource.includes(marker)) {
         sidecarSource = SHIM_BODY + sidecarSource;
@@ -1768,16 +2384,9 @@ for (const d of extraUnpackDirs) {
 }
 log('Fully-unpacked top directories: ' + fullyUnpackedDirs.length);
 
-// Compose the asar `unpackDir` glob. It is matched against directory
-// entries, so "cli" matches the cli/ tree recursively. Brace-list of
-// ~10 paths is fast.
-const unpackDirPattern = '{' + fullyUnpackedDirs.map(d =>
-    d.replace(/[{}(),*?[\]!|+@\\]/g, ch => '\\' + ch)
-).join(',') + '}';
-
 // Also compute any individual unpacked files that live in partially-packed
 // directories (e.g. a single file under node_modules/foo/ where only that
-// one file is unpacked). Collect them and use an explicit --unpack glob.
+// one file is unpacked).
 const partialUnpackedFiles = [];
 function findPartialFiles(node, relPath) {
     if (!node.files) return;
@@ -1800,11 +2409,41 @@ function findPartialFiles(node, relPath) {
 findPartialFiles(header, '');
 log('Partially-unpacked individual files: ' + partialUnpackedFiles.length);
 
-const unpackPattern = partialUnpackedFiles.length
-    ? '{' + partialUnpackedFiles.map(p =>
-        p.replace(/[{}(),*?[\]!|+@\\]/g, ch => '\\' + ch)
-    ).join(',') + '}'
-    : undefined;
+// ---------------------------------------------------------------------------
+// 关键修正（5.9.x）：部分解包的文件**不能**用 options.unpack 表达。
+//
+// @electron/asar 的 shouldUnpackPath() 对文件分支传的是
+// path.relative(src, path.dirname(filename))，也就是**父目录**，
+// 再用 minimatch(parentDir, pattern, { matchBase: true }) 去比。
+// 因此过去那种 "{renderer/assets/a.woff,main/qimei-helper.js,...}" 的文件级
+// brace glob 一次都匹配不上——5.9.3 实测有 323 个原本 unpacked 的文件被静默
+// 塞进 asar（asar 反而涨了 16MB），其中包含 .node 与渲染资源。
+//
+// 只有 unpackDir（目录级）能真正生效。这里把"部分解包文件"的父目录并进
+// unpackDir 集合：语义上会多解包几个同目录的兄弟文件，所以 pack 之后要把
+// staging sidecar 合并回真实 app.asar.unpacked，保证每个 unpacked 条目在
+// 磁盘上都有实体文件，否则运行期会 ENOENT。
+// ---------------------------------------------------------------------------
+const escGlob = p => p.replace(/[{}(),*?[\]!|+@\\]/g, ch => '\\' + ch);
+const partialDirs = [...new Set(partialUnpackedFiles.map(p => p.split('/').slice(0, -1).join('/')))];
+for (const d of partialDirs) {
+    if (d && !fullyUnpackedDirs.includes(d)) fullyUnpackedDirs.push(d);
+}
+log('Unpack directories (fully-unpacked + partial parents): ' + fullyUnpackedDirs.length);
+
+// Drop any dir whose ancestor is already in the set: the asar matcher treats a
+// matched dir as "everything below it", so children are redundant.
+const unpackDirSet = new Set(fullyUnpackedDirs);
+const minimalUnpackDirs = fullyUnpackedDirs.filter(d => {
+    const parts = d.split('/');
+    for (let i = 1; i < parts.length; i++) {
+        if (unpackDirSet.has(parts.slice(0, i).join('/'))) return false;
+    }
+    return true;
+});
+const unpackDirPattern = '{' + minimalUnpackDirs.map(escGlob).join(',') + '}';
+const unpackPattern = undefined; // 见上：文件级 unpack glob 无效
+log('unpackDir 条目: ' + minimalUnpackDirs.length + '（pattern 长度 ' + unpackDirPattern.length + '）');
 
 assertRequiredPatches();
 
@@ -1821,6 +2460,14 @@ assertRequiredPatches();
 // unpack set. We throw that output away.
 // ---------------------------------------------------------------------------
 (async () => {
+    if (FLAGS.dryRun) {
+        summarizeReport();
+        log('--dry-run：只分析不落盘，app.asar 保持原样');
+        const dryReport = path.join(os.tmpdir(), 'wb-patch-report.' + Date.now() + '.json');
+        fs.writeFileSync(dryReport, JSON.stringify(patchReport, null, 2));
+        log('dry-run 报告：' + dryReport);
+        return;
+    }
     const outPath = asarPath + '.new';
     const stagingSidecar = outPath + '.unpacked';
     try { fs.rmSync(outPath, { force: true }); } catch (_) {}
@@ -1843,17 +2490,61 @@ assertRequiredPatches();
     }
     try { fs.rmSync(asarPath + '.prepatch'); } catch (_) {}
 
-    // Discard the repack's sidecar directory; the on-disk one is already
-    // correct and contains additional files (rebuilt native modules,
-    // Linux binaries) that the staging dir does not have.
+    // 合并 repack 的 sidecar 到真实 app.asar.unpacked。
+    //
+    // 新 header 里 unpacked=true 的条目必须能在磁盘上找到实体文件，否则
+    // require()/dlopen() 会 ENOENT。pack 阶段因为用了目录级 unpackDir，
+    // 解包范围是原始集合的超集，多出来的兄弟文件需要补到 sidecar 里。
+    //
+    // 覆盖策略：tmpDir 才是权威副本（它由原 sidecar + 本脚本的改动合成），
+    // 因此按 tmpDir 覆写 sidecar。否则像 main/main-bootstrap.js 这种"原本就在
+    // sidecar 里、又被补丁改过"的文件会保留旧版本，补丁静默丢失。
+    const mergeSidecar = (srcDirAbs, dstDirAbs) => {
+        if (!fs.existsSync(srcDirAbs)) return { synced: 0 };
+        let synced = 0;
+        const walkMerge = (src, rel) => {
+            for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+                const s = path.join(src, e.name);
+                const r = rel ? rel + '/' + e.name : e.name;
+                const d = path.join(dstDirAbs, r);
+                if (e.isDirectory()) {
+                    fs.mkdirSync(d, { recursive: true });
+                    walkMerge(s, r);
+                    continue;
+                }
+                try {
+                    fs.mkdirSync(path.dirname(d), { recursive: true });
+                    fs.cpSync(s, d, { force: true });
+                    synced++;
+                } catch (_) {}
+            }
+        };
+        walkMerge(srcDirAbs, '');
+        return { synced };
+    };
+    try {
+        const merged = mergeSidecar(stagingSidecar, asarPath + '.unpacked');
+        log('synced unpacked entries into app.asar.unpacked: ' + merged.synced);
+    } catch (err) {
+        console.warn('[apply-linux-patches] sidecar merge failed: ' + err.message);
+    }
     try { fs.rmSync(stagingSidecar, { recursive: true, force: true }); } catch (_) {}
 
     const reportPath = path.join(path.dirname(asarPath), '..', '.workbuddy-linux', 'patch-report.json');
+    summarizeReport();
     try {
         fs.mkdirSync(path.dirname(reportPath), { recursive: true });
         fs.writeFileSync(reportPath, JSON.stringify(patchReport, null, 2));
+        log('patch report: ' + reportPath);
     } catch (err) {
         console.warn('[apply-linux-patches] failed to write patch report: ' + err.message);
+    }
+
+    const retired = Object.entries(patchReport.patches)
+        .filter(([, p]) => p.status === STATUS.UPSTREAM)
+        .map(([n]) => n);
+    if (retired.length) {
+        log('可退役补丁（上游已原生实现）: ' + retired.join(', '));
     }
 
     log('replaced app.asar in place (app.asar.unpacked left untouched)');

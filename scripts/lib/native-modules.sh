@@ -357,6 +357,78 @@ refresh_npm_package() {
     cp -a "$source_path" "$package_path"
 }
 
+ensure_loong64_pty_pkg() {
+    # Build the official @lydell/node-pty-linux-loong64 layout at
+    #   <app_dir>/<rel_pkg_root>/node-pty-linux-loong64/
+    # from the Phase 3 rebuilt node-pty binary and its source lib/.
+    local app_dir="$1"
+    local rel_pkg_root="$2"
+    local pty_loong_pkg="$app_dir/$rel_pkg_root/node-pty-linux-loong64"
+    local pty_bin="$app_dir/node_modules/node-pty/build/Release/pty.node"
+    local pty_src_lib="$app_dir/node_modules/node-pty/lib"
+    local pty_version lipids lib_file
+
+    if [ -d "$pty_loong_pkg/prebuilds/linux-loong64" ] && [ -f "$pty_loong_pkg/prebuilds/linux-loong64/pty.node" ]; then
+        info "  loong64 @lydell pty pkg already present at $rel_pkg_root (official layout)"
+        return 0
+    fi
+
+    [ -f "$pty_bin" ] || { warn "  Cannot find rebuilt pty.node for $rel_pkg_root loong64 pkg"; return 1; }
+    [ -d "$pty_src_lib" ] || { warn "  Cannot find node-pty lib/ source for $rel_pkg_root loong64 pkg"; return 1; }
+
+    rm -rf "$pty_loong_pkg"
+    mkdir -p "$pty_loong_pkg/lib" "$pty_loong_pkg/prebuilds/linux-loong64"
+    cp "$pty_bin" "$pty_loong_pkg/prebuilds/linux-loong64/pty.node"
+
+    # Only the plain lib/*.js (skip *.map / tests) — the official platform
+    # package ships exactly these seven files. Copying lets us match the
+    # loadNativeModule() lookup without a synthetic index.js shim.
+    for lib_file in eventEmitter2.js interfaces.js types.js utils.js index.js terminal.js unixTerminal.js; do
+        if [ -f "$pty_src_lib/$lib_file" ]; then
+            cp "$pty_src_lib/$lib_file" "$pty_loong_pkg/lib/$lib_file"
+        else
+            warn "  node-pty lib/$lib_file missing; loong64 pkg may be incomplete"
+        fi
+    done
+
+    pty_version="$(node -e 'const p=require(process.argv[1]);process.stdout.write(String(p.version||""));' "$app_dir/node_modules/@lydell/node-pty/package.json" 2>/dev/null || echo '1.2.0-beta.14')"
+
+    cat > "$pty_loong_pkg/package.json" << PKGJSON
+{
+  "name": "@lydell/node-pty-linux-loong64",
+  "version": "$pty_version",
+  "description": "The node-pty package, stripped down only for linux-loong64 (built by workbuddy-linux).",
+  "license": "MIT",
+  "type": "commonjs",
+  "exports": "./lib/index.js",
+  "os": ["linux"],
+  "cpu": ["loong64"]
+}
+PKGJSON
+
+    # @lydell/node-pty picks its platform binary via dynamic require, gated on
+    # "PACKAGE_NAME in optionalDependencies" of the MAIN package. If loong64 is
+    # missing there, it falls through to "not support your platform" even when
+    # the platform package exists on disk. Inject the entry idempotently.
+    local main_pty_pkg="$(dirname "$pty_loong_pkg")/node-pty/package.json"
+    if [ -f "$main_pty_pkg" ]; then
+        python3 - "$main_pty_pkg" "@lydell/node-pty-linux-loong64" "$pty_version" << 'PYINJ' 2>/dev/null || true
+import json, sys
+path, name, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, encoding="utf-8") as f:
+    pkg = json.load(f)
+od = pkg.setdefault("optionalDependencies", {})
+if od.get(name) != ver:
+    od[name] = ver
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(pkg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+PYINJ
+    fi
+
+    info "  Assembled official-layout loong64 @lydell pty pkg at $rel_pkg_root (@lydell/node-pty-linux-loong64@$pty_version)"
+}
+
 install_lydell_node_pty_linux() {
     local target_dir="$1"
     local lydell_pkg="$target_dir/node_modules/@lydell/node-pty/package.json"
@@ -469,40 +541,21 @@ install_linux_platform_packages() {
         install_lydell_node_pty_linux "$app_dir/cli"
     fi
 
-    # Loongarch64: create a synthetic @lydell/node-pty-linux-loong64 at the
-    # top-level node_modules using the node-pty binary rebuilt in Phase 3.
-    # This is required so that apply-linux-patches.js can find and copy the
-    # platform package into the asar during repack. npm does not publish
-    # @lydell/node-pty-linux-loong64, so we build it from the rebuild output.
+    # Loongarch64: npm publishes no @lydell/node-pty-linux-loong64, and
+    # install_lydell_node_pty_linux()  above fails (warn+return 0) for it,
+    # leaving both top-level and cli node_modules WITHOUT a loong64 platform
+    # package. @lydell/node-pty then throws "does not support your platform",
+    # which is exactly what killed the 5.8.3 sidecar at startup.
+    #
+    # Fix: assemble the OFFICIAL package layout (package.json exports
+    # ./lib/index.js + lib/*.js + prebuilds/linux-loong64/pty.node) for BOTH
+    # top-level and cli node_modules, from the Phase 3 rebuilt node-pty binary
+    # and the node-pty source lib. This matches how the real platform packages
+    # are structured and passes apply-linux-patches.js repack + asar unpack.
     if [ "$ARCH" = "loongarch64" ]; then
-        local pty_loong_pkg="$app_dir/node_modules/@lydell/node-pty-linux-loong64"
-        if [ ! -d "$pty_loong_pkg" ]; then
-            local pty_node="$app_dir/node_modules/node-pty/build/Release/pty.node"
-            if [ -f "$pty_node" ]; then
-                mkdir -p "$pty_loong_pkg/build/Release"
-                cp "$pty_node" "$pty_loong_pkg/build/Release/pty.node"
-                local pty_version="1.2.0-beta.14"
-                cat > "$pty_loong_pkg/package.json" << PKGJSON
-{
-  "name": "@lydell/node-pty-linux-loong64",
-  "version": "$pty_version",
-  "main": "index.js",
-  "os": ["linux"],
-  "cpu": ["loong64"]
-}
-PKGJSON
-                cat > "$pty_loong_pkg/index.js" << 'INDEXJS'
-// Synthetic platform package for loong64: load node-pty via absolute
-// filesystem path to bypass asar module resolution.
-var path = require("path");
-var resourcesPath = process.resourcesPath || path.dirname(process.execPath);
-var nodePtyPath = path.join(resourcesPath, "app.asar.unpacked", "node_modules", "node-pty");
-module.exports = require(nodePtyPath);
-INDEXJS
-                info "  Created synthetic top-level @lydell/node-pty-linux-loong64 from rebuilt binary"
-            else
-                warn "  Cannot find rebuilt node-pty binary for synthetic loong64 platform package"
-            fi
+        ensure_loong64_pty_pkg "$app_dir" "node_modules/@lydell"
+        if [ -d "$app_dir/cli/node_modules/@lydell/node-pty" ]; then
+            ensure_loong64_pty_pkg "$app_dir" "cli/node_modules/@lydell"
         fi
     fi
 

@@ -10,6 +10,63 @@
 
 ---
 
+## [5.9.3+wb1] — 2026-11-02
+
+目标上游版本：WorkBuddy `5.9.3.42398134`（macOS x64 DMG，构建号 `d4692421`），Electron 37.10.3（DMG 自带）。
+
+### 逆向结论：5.9.x 把大部分补丁"做进了上游"
+
+对照 DMG 与本机可运行安装（darwin 资源 + 龙芯 Electron 43.7.7）后确认，5.9.3 的主进程从单文件
+`main/index.js` 拆成 300+ 个 `main/*.js` 模块并重命名，同时原先靠补丁规避的问题已在官方代码里修掉：
+
+| 当年补丁 | 5.9.3 上游实现 | 处理 |
+|---|---|---|
+| `mainEnvShim` / `sidecarEnvShim`（ACC_PRODUCT_CONFIG_* → E2BIG） | `module-base.js` 落盘 `workbuddy-product-spill-*`，改用 `ACC_PRODUCT_CONFIG_PATH` 传递 | `upstream-native`，跳过注入 |
+| `trayContextMenu` / `trayIconPath` | `TrayController` 内 `process.platform==='linux' ? tray.setContextMenu(buildFallbackMenu())`，并按 `tray-linux.png` 取图标 | `upstream-native` |
+| `updateServiceDisabled` | 新增 `main/update-service.linux.js`（AppImage 自更新），由 `linuxSelfUpdateSupported` 门控 | `upstream-native` |
+| `cliIsCliInstalledTimeout` | `isCliInstalled` 的 `which` 调用已带 `timeout:5e3` | 目的已达成，锚点消失 |
+| `linuxQuitWindowAllClosed` | `window-all-closed` 已按平台分支（非 darwin 且托盘存活时保留进程） | 目的已达成，锚点消失 |
+
+### 修复（两个真 bug）
+
+- **`updateRpcDisabled` 曾是假成功**：5.8 分支注入的 `require_netdrive_env_route.Ni(...)` 在 5.9.3 上不存在
+  （真正的注册函数是 `require_handler_registry.t`），整段包在 `try/catch` 里 → 补丁静默空转却报告 `true`。
+  现在改为**从目标文件反查注册函数名**，查不到就如实记 `anchor-gone`，绝不写空转代码。
+- **asar 重新打包时部分解包文件被静默塞回 asar**：`@electron/asar` 的文件分支把 `path.dirname(filename)`
+  交给 `minimatch(matchBase:true)`，所以过去那种文件级 `{a.woff,b.js,...}` brace glob 一次都匹配不上。
+  实测 5.9.3 有 323 个原本 `unpacked` 的文件（含 `.node` 与 renderer 资源）被打进 asar，体积反涨 16MB。
+  现在改为**目录级 `unpackDir`**（原始全解包目录 + 部分解包文件的父目录），并在 pack 之后
+  把 staging sidecar 同步回 `app.asar.unpacked`，保证每个 `unpacked` 条目在磁盘上都有实体文件
+  （否则运行期 ENOENT），同时避免"补丁改的是 tmpDir、运行读的是旧 sidecar"导致的补丁丢失。
+
+### 新增
+
+- **补丁状态词表**：`applied` / `upstream-native` / `anchor-gone` / `failed`。锚点缺失不再打印 `ERROR`，
+  而是 `NOTE` 并计入报告；`patch-report.json` 增加 `patches`、`capabilities`、`counts`、`verdict`，便于每次
+  上游升级后一眼看出"哪些补丁可以退役"。`--strict` 可把 `anchor-gone` 也当失败（CI 用）。
+- **能力探测**：一次性扫描 `main/*.js`，判定 `productConfigSpill` / `linuxTray` / `linuxUpdateService` /
+  `cliExecTimeout` / `lifecyclePlatformAware` / `moduleSplit`，据此跳过对应补丁段落。
+- **`--layout=<outDir>` 转换模式**：把"从 dmg 到本机可运行 loong64"这条链路固化进本脚本：
+  1. 整棵 `Resources/` 搬迁；
+  2. 按规则剔除 mac 专属物（`.dylib/.icns/*.lproj`、`*darwin*`、mac 工具、无 loong64 预编译的 `@ban-dal`、
+     非目标架构的 `@lydell/node-pty-*`），asar 内同样剔除；
+  3. 覆盖 loong64 原生层（Electron 运行时、`node-pty`、`koffi/linux_loong64`、`im-napi.node`、
+     `im-channels-native`、ripgrep/genie-trash vendor、tray 图标、`wb-storage-shim.cjs`、`default_app.asar`）；
+  4. 启动器里写死的 `DIR="/opt/WorkBuddy"` 改写成"脚本所在目录"，输出目录可搬迁；
+  5. `pty.node` 架构校验（ELF `e_machine`），非 loongarch64 就换成参考安装里的那份；
+  6. 原生件体检：`loongarch64` / 其他平台（惰性）/ 可疑，输出 `convert-report.json`。
+- `--arch`、`--runtime-from`、`--native-from`、`--dry-run`、`--force-env-shim`。
+
+### 验证（loongnix 25.1 / 龙芯 3A6000）
+
+以 `WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg` + 本机 `/opt/WorkBuddy` 为参考运行 6 次迭代后：
+转换树与 `/opt/WorkBuddy` 的差异仅剩 `app.asar`（已打补丁）、`.workbuddy-linux/patch-report.json`、
+`convert-report.json`；`node --check` 通过；`ELECTRON_RUN_AS_NODE=1 ./electron` 下 require asar（版本 5.9.3）
+与 `@lydell/node-pty-linux-loong64` 实弹 `pty.spawn` 均成功（`PTY_OK_42`）；主进程引导到
+`MARK A8(single_instance_locked)`，无原生模块加载错误。
+
+---
+
 ## [5.3.3+wb1] — 2026-07-24
 
 目标上游版本：WorkBuddy `5.3.3.33961208`（macOS x64 DMG，构建号 `5801cce5`），Electron 37.10.3。
