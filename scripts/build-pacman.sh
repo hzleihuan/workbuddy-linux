@@ -46,6 +46,12 @@ main() {
     cp -a "$APP_DIR/." "$pkgdir/opt/$INSTALL_DIRNAME/"
     sanitize_package_tree "$pkgdir"
 
+    # cp -a 会原样保留源权限；源树中形如 744 的可执行文件（safe-bin/rm、
+    # brokered-bin/zip、内置插件脚本等）装到系统后普通用户无权执行，
+    # 这里统一补上组/其他执行位。chrome-sandbox 稍后单独设为 4755。
+    find "$pkgdir/opt/$INSTALL_DIRNAME" -type f -perm -u+x ! -perm -o+x \
+        -exec chmod 0755 {} + 2>/dev/null || true
+
     sed -e "s|__EXEC__|/opt/$INSTALL_DIRNAME/start.sh %F|g" "$DESKTOP_TEMPLATE" \
         > "$pkgdir/usr/share/applications/$PACKAGE_NAME.desktop"
     chmod 0644 "$pkgdir/usr/share/applications/$PACKAGE_NAME.desktop"
