@@ -81,9 +81,9 @@ workbuddy --verbose
 如果安装后的版本 GPU 子进程启动失败，确认 `chrome-sandbox` 具有 SUID 权限：
 
 ```bash
-ls -la /opt/workbuddy/chrome-sandbox
+ls -la /opt/WorkBuddy/chrome-sandbox
 # 应显示 -rwsr-xr-x root:root
-# 如权限不对，修复：sudo chmod 4755 /opt/workbuddy/chrome-sandbox && sudo chown root:root /opt/workbuddy/chrome-sandbox
+# 如权限不对，修复：sudo chmod 4755 /opt/WorkBuddy/chrome-sandbox && sudo chown root:root /opt/WorkBuddy/chrome-sandbox
 ```
 
 如果 UI 能打开，但终端或文件监听失败，请检查：
@@ -183,9 +183,9 @@ To debug GPU issues separately, remove that flag and check:
 If the installed version has GPU subprocess launch failures, verify `chrome-sandbox` has SUID permissions:
 
 ```bash
-ls -la /opt/workbuddy/chrome-sandbox
+ls -la /opt/WorkBuddy/chrome-sandbox
 # Should show -rwsr-xr-x root:root
-# If permissions are wrong, fix with: sudo chmod 4755 /opt/workbuddy/chrome-sandbox && sudo chown root:root /opt/workbuddy/chrome-sandbox
+# If permissions are wrong, fix with: sudo chmod 4755 /opt/WorkBuddy/chrome-sandbox && sudo chown root:root /opt/WorkBuddy/chrome-sandbox
 ```
 
 If the UI opens but terminal or file watching fails, inspect:

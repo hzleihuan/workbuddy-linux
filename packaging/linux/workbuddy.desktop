@@ -6,5 +6,5 @@ Icon=workbuddy
 Type=Application
 Categories=Development;IDE;
 StartupNotify=true
-StartupWMClass=WorkBuddy
+StartupWMClass=workbuddy
 MimeType=x-scheme-handler/workbuddy;
