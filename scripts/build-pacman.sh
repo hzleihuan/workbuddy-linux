@@ -10,6 +10,9 @@ APP_DIR="${APP_DIR:-$REPO_DIR/workbuddy-app}"
 DIST_DIR="${DIST_DIR:-$REPO_DIR/dist}"
 PKG_WORK="${PKG_WORK:-$DIST_DIR/pacman-work}"
 PACKAGE_NAME="${PACKAGE_NAME:-workbuddy}"
+# 安装目录名与包名解耦：deb/rpm/pacman 包名必须小写，但安装路径要与官方
+# loong64 包的 /opt/WorkBuddy 布局一致，才能原地覆盖升级。
+INSTALL_DIRNAME="${INSTALL_DIRNAME:-WorkBuddy}"
 PACKAGE_VERSION="${PACKAGE_VERSION:-$(resolve_package_version)}"
 PACMAN_VERSION="${PACKAGE_VERSION//+/_}"
 PACMAN_VERSION="${PACMAN_VERSION//-/_}"
@@ -35,21 +38,21 @@ main() {
 
     rm -rf "$PKG_WORK"
     mkdir -p \
-        "$pkgdir/opt/$PACKAGE_NAME" \
+        "$pkgdir/opt/$INSTALL_DIRNAME" \
         "$pkgdir/usr/bin" \
         "$pkgdir/usr/share/applications" \
         "$pkgdir/usr/share/icons/hicolor/256x256/apps"
 
-    cp -a "$APP_DIR/." "$pkgdir/opt/$PACKAGE_NAME/"
+    cp -a "$APP_DIR/." "$pkgdir/opt/$INSTALL_DIRNAME/"
     sanitize_package_tree "$pkgdir"
 
-    sed -e "s|__EXEC__|/opt/$PACKAGE_NAME/start.sh %F|g" "$DESKTOP_TEMPLATE" \
+    sed -e "s|__EXEC__|/opt/$INSTALL_DIRNAME/start.sh %F|g" "$DESKTOP_TEMPLATE" \
         > "$pkgdir/usr/share/applications/$PACKAGE_NAME.desktop"
     chmod 0644 "$pkgdir/usr/share/applications/$PACKAGE_NAME.desktop"
 
     cat > "$pkgdir/usr/bin/$PACKAGE_NAME" <<EOF
 #!/bin/bash
-exec /opt/$PACKAGE_NAME/start.sh "\$@"
+exec /opt/$INSTALL_DIRNAME/start.sh "\$@"
 EOF
     chmod 0755 "$pkgdir/usr/bin/$PACKAGE_NAME"
 
@@ -59,8 +62,8 @@ EOF
         chmod 0644 "$pkgdir/usr/share/icons/hicolor/256x256/apps/workbuddy.png"
     fi
 
-    if [ -f "$pkgdir/opt/$PACKAGE_NAME/chrome-sandbox" ]; then
-        chmod 4755 "$pkgdir/opt/$PACKAGE_NAME/chrome-sandbox"
+    if [ -f "$pkgdir/opt/$INSTALL_DIRNAME/chrome-sandbox" ]; then
+        chmod 4755 "$pkgdir/opt/$INSTALL_DIRNAME/chrome-sandbox"
     fi
 
     local installed_size

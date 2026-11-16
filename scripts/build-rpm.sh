@@ -10,6 +10,9 @@ APP_DIR="${APP_DIR:-$REPO_DIR/workbuddy-app}"
 DIST_DIR="${DIST_DIR:-$REPO_DIR/dist}"
 PKG_ROOT="${PKG_ROOT:-$DIST_DIR/rpm-root}"
 PACKAGE_NAME="${PACKAGE_NAME:-workbuddy}"
+# 安装目录名与包名解耦：deb/rpm/pacman 包名必须小写，但安装路径要与官方
+# loong64 包的 /opt/WorkBuddy 布局一致，才能原地覆盖升级。
+INSTALL_DIRNAME="${INSTALL_DIRNAME:-WorkBuddy}"
 PACKAGE_VERSION="${PACKAGE_VERSION:-$(resolve_package_version)}"
 RPM_VERSION="${PACKAGE_VERSION//+/_}"
 RPM_VERSION="${RPM_VERSION//-/_}"
@@ -36,26 +39,26 @@ main() {
 
     rm -rf "$PKG_ROOT" "$output_dir"
     mkdir -p \
-        "$PKG_ROOT/opt/$PACKAGE_NAME" \
+        "$PKG_ROOT/opt/$INSTALL_DIRNAME" \
         "$PKG_ROOT/usr/bin" \
         "$PKG_ROOT/usr/share/applications" \
         "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps" \
         "$output_dir/BUILD" "$output_dir/RPMS" "$output_dir/SOURCES" "$output_dir/SPECS" "$output_dir/SRPMS"
 
-    cp -a "$APP_DIR/." "$PKG_ROOT/opt/$PACKAGE_NAME/"
+    cp -a "$APP_DIR/." "$PKG_ROOT/opt/$INSTALL_DIRNAME/"
     sanitize_package_tree "$PKG_ROOT"
 
     # Set SUID bit on chrome-sandbox so Chromium can spawn child processes
-    if [ -f "$PKG_ROOT/opt/$PACKAGE_NAME/chrome-sandbox" ]; then
-        chmod 4755 "$PKG_ROOT/opt/$PACKAGE_NAME/chrome-sandbox"
+    if [ -f "$PKG_ROOT/opt/$INSTALL_DIRNAME/chrome-sandbox" ]; then
+        chmod 4755 "$PKG_ROOT/opt/$INSTALL_DIRNAME/chrome-sandbox"
     fi
     cat > "$PKG_ROOT/usr/bin/$PACKAGE_NAME" <<EOF
 #!/bin/bash
-exec /opt/$PACKAGE_NAME/start.sh "\$@"
+exec /opt/$INSTALL_DIRNAME/start.sh "\$@"
 EOF
     chmod 0755 "$PKG_ROOT/usr/bin/$PACKAGE_NAME"
 
-    sed -e "s|__EXEC__|/opt/$PACKAGE_NAME/start.sh %F|g" "$DESKTOP_TEMPLATE" \
+    sed -e "s|__EXEC__|/opt/$INSTALL_DIRNAME/start.sh %F|g" "$DESKTOP_TEMPLATE" \
         > "$PKG_ROOT/usr/share/applications/$PACKAGE_NAME.desktop"
 
     if [ -f "$APP_DIR/.workbuddy-linux/workbuddy.png" ]; then
@@ -87,7 +90,7 @@ mkdir -p %{buildroot}
 cp -a $PKG_ROOT/. %{buildroot}/
 
 %files
-/opt/$PACKAGE_NAME
+/opt/$INSTALL_DIRNAME
 /usr/bin/$PACKAGE_NAME
 /usr/share/applications/$PACKAGE_NAME.desktop
 $icon_files_entry
