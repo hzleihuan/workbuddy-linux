@@ -200,14 +200,17 @@ if [ "${WORKBUDDY_DISABLE_SANDBOX:-0}" = "1" ] || [ -n "${APPIMAGE:-}" ]; then
 fi
 
 # ---- Launch Electron ----
-exec "$APPDIR/opt/workbuddy/electron" "${ARGS[@]}" "$@"
+exec "$APPDIR/opt/__APP_ID__/electron" "${ARGS[@]}" "$@"
 APPRUN
     chmod 0755 "$appdir_path/AppRun"
+    # AppRun 是单引号 heredoc，变量不会展开；占位符在此注入，
+    # 保证 AppDir 内的 opt 目录名与 $APP_ID 始终一致。
+    sed -i "s|__APP_ID__|$APP_ID|g" "$appdir_path/AppRun"
 
     # ---------------------------------------------------------------
     # 3. Desktop entry
     # ---------------------------------------------------------------
-    sed -e "s|__EXEC__|opt/workbuddy/start.sh %F|g" "$DESKTOP_TEMPLATE" \
+    sed -e "s|__EXEC__|opt/$APP_ID/start.sh %F|g" "$DESKTOP_TEMPLATE" \
         > "$appdir_path/usr/share/applications/$APP_ID.desktop"
     chmod 0644 "$appdir_path/usr/share/applications/$APP_ID.desktop"
     # Also link root-level .desktop for appimagetool discovery
